@@ -6,7 +6,8 @@ from datetime import datetime, timedelta
 import json
 import os
 from typing import Dict, List, Any, Optional
-
+from dotenv import load_dotenv
+load_dotenv()
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -512,8 +513,8 @@ class FDRDataCollector:
 # Usage example
 if __name__ == "__main__":
     # Replace with your actual API tokens
-    sportmonks_token = "GH7YT0CYNgDWcl99LLPkYRR6cWnVZchVhz1IL6QpTBy5ciYSyyPs5mEv8n82"
-    goalserve_token = "0f6230689b674453eee508dd50f5b2ca"  # From your example
+    sportmonks_token = os.getenv("SPORTMONKS_API_KEY")
+    goalserve_token = os.getenv("GOALSERVE_API_KEY")
     
     collector = FDRDataCollector(sportmonks_token, goalserve_token)
     collector.collect_all_fdr_data()
