@@ -273,14 +273,46 @@ class FDRDataCollector:
         try:
             response = requests.get(self.goalserve_outright_url)
             response.raise_for_status()
-            data = response.json()
+            xml_data = response.text
             
-            self._save_data("goalserve_outright_odds.json", data)
-            logger.info("Saved outright odds data")
-            return data
+            # Save raw XML 
+            with open(os.path.join(self.data_dir, "goalserve_outright_odds.xml"), "w") as f:
+                f.write(xml_data)
+            
+            # Parse XML to structured data
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(xml_data)
+            
+            # Extract data similar to example in search result #1
+            outright_odds = []
+            for category in root.findall('category'):
+                category_name = category.get('name')
+                for outrights in category.findall('outrights'):
+                    for market in outrights.findall('market'):
+                        market_name = market.get('name')
+                        for sel in market.findall('sel'):
+                            team_name = sel.get('name')
+                            odds_list = []
+                            for bookmaker in sel.findall('bookmaker'):
+                                bookmaker_name = bookmaker.get('name')
+                                odd_value = bookmaker.find('odd').get('value')
+                                odds_list.append({'bookmaker': bookmaker_name, 'odd': float(odd_value)})
+                            outright_odds.append({
+                                'category': category_name,
+                                'market': market_name,
+                                'team': team_name,
+                                'odds': odds_list
+                            })
+            
+            # Save structured data as JSON
+            self._save_data("goalserve_outright_odds_parsed.json", outright_odds)
+            logger.info(f"Saved outright odds data: {len(outright_odds)} records")
+            return outright_odds
+            
         except Exception as e:
             logger.error(f"Error fetching outright odds: {str(e)}")
             return None
+
     
     def get_goalserve_fixture_odds(self):
         """Get fixture odds from GoalServe"""
