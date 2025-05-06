@@ -326,12 +326,126 @@ class FDRDataCollector:
             logger.error("Failed to fetch fixture odds")
             return None
         
-        # Save raw XML for now (would need XML parser for structured data)
+        # Save raw XML
         with open(os.path.join(self.data_dir, "goalserve_fixture_odds.xml"), "w") as f:
             f.write(xml_response)
         
-        logger.info("Saved fixture odds data")
-        return xml_response
+        # Parse XML
+        try:
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(xml_response)
+            
+            fixture_odds = []
+            
+            # Process each category (league)
+            for category in root.findall('category'):
+                category_name = category.get('name')
+                category_id = category.get('id')
+                
+                # Process matches in this category
+                matches_elem = category.find('matches')
+                if matches_elem is None:
+                    continue
+                    
+                for match in matches_elem.findall('match'):
+                    match_id = match.get('id')
+                    match_date = match.get('date')
+                    match_time = match.get('time')
+                    match_status = match.get('status')
+                    
+                    # Get teams
+                    local_team = match.find('localteam')
+                    visitor_team = match.find('visitorteam')
+                    
+                    if local_team is None or visitor_team is None:
+                        continue
+                        
+                    local_team_name = local_team.get('name')
+                    local_team_id = local_team.get('id')
+                    visitor_team_name = visitor_team.get('name')
+                    visitor_team_id = visitor_team.get('id')
+                    
+                    # Get odds
+                    odds_elem = match.find('odds')
+                    if odds_elem is None:
+                        continue
+                    
+                    match_odds = {
+                        'match_id': match_id,
+                        'category_name': category_name,
+                        'category_id': category_id,
+                        'match_date': match_date,
+                        'match_time': match_time,
+                        'match_status': match_status,
+                        'local_team': {
+                            'id': local_team_id,
+                            'name': local_team_name
+                        },
+                        'visitor_team': {
+                            'id': visitor_team_id,
+                            'name': visitor_team_name
+                        },
+                        'odds': []
+                    }
+                    
+                    # Process odds by type (focusing on Match Winner for FDR calculations)
+                    for odds_type in odds_elem.findall('type'):
+                        type_value = odds_type.get('value')
+                        type_id = odds_type.get('id')
+                        
+                        bookmakers_data = []
+                        
+                        for bookmaker in odds_type.findall('bookmaker'):
+                            bookmaker_name = bookmaker.get('name')
+                            bookmaker_id = bookmaker.get('id')
+                            
+                            # Extract home, draw, away odds
+                            home_odd = None
+                            draw_odd = None
+                            away_odd = None
+                            
+                            for odd in bookmaker.findall('odd'):
+                                odd_name = odd.get('name')
+                                odd_value = odd.get('value')
+                                
+                                if odd_name == "Home":
+                                    home_odd = float(odd_value)
+                                elif odd_name == "Draw":
+                                    draw_odd = float(odd_value)
+                                elif odd_name == "Away":
+                                    away_odd = float(odd_value)
+                            
+                            # Only add complete sets of odds
+                            if type_value == "Match Winner" and home_odd and draw_odd and away_odd:
+                                bookmakers_data.append({
+                                    'bookmaker_id': bookmaker_id,
+                                    'bookmaker_name': bookmaker_name,
+                                    'home_odd': home_odd,
+                                    'draw_odd': draw_odd,
+                                    'away_odd': away_odd
+                                })
+                        
+                        if bookmakers_data:
+                            match_odds['odds'].append({
+                                'type_id': type_id,
+                                'type_value': type_value,
+                                'bookmakers': bookmakers_data
+                            })
+                    
+                    # Only add matches with valid odds data
+                    if match_odds['odds']:
+                        fixture_odds.append(match_odds)
+            
+            # Save structured data
+            self._save_data("goalserve_fixture_odds_parsed.json", fixture_odds)
+            logger.info(f"Saved fixture odds data: {len(fixture_odds)} records")
+            return fixture_odds
+            
+        except Exception as e:
+            logger.error(f"Error parsing fixture odds XML: {str(e)}")
+            return None
+
+
     
     def _save_data(self, filename, data):
         """Save data to JSON file"""
