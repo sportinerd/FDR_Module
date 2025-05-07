@@ -450,21 +450,30 @@ class FDRDataCollector:
         """Get pre-match odds from Sportmonks API"""
         logger.info("Fetching pre-match odds from Sportmonks")
         
-        # Base endpoint for pre-match odds
+        odds_base_url = "https://api.sportmonks.com/v3/odds"
+        
         if fixture_id:
-            endpoint = f"/odds/pre-match/fixtures/{fixture_id}"
+            url = f"{odds_base_url}/pre-match/fixtures/{fixture_id}"
             params = {"include": "market,bookmaker"}
         else:
-            endpoint = "/odds/pre-match"
+            url = f"{odds_base_url}/pre-match"
             params = {"include": "market,bookmaker,fixture", "per_page": 100}
         
-        response = self.sportmonks_request(endpoint, params)
-        
-        if not response or "data" not in response:
-            logger.error(f"Failed to fetch pre-match odds from Sportmonks")
+        # Send the request directly with full URL
+        headers = {"Authorization": self.sportmonks_token}
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "data" not in data:
+                logger.error(f"Failed to fetch pre-match odds from Sportmonks")
+                return []
+            
+            odds_data = data["data"]
+        except Exception as e:
+            logger.error(f"Error fetching pre-match odds from Sportmonks: {str(e)}")
             return []
-        
-        odds_data = response["data"]
         
         # Save to file
         filename = "sportmonks_prematch_odds.json"
@@ -561,6 +570,12 @@ class FDRDataCollector:
         
         # 8. Get fixture odds from GoalServe
         self.get_goalserve_fixture_odds()
+        
+        # 9. Get pre-match odds from Sportmonks
+        self.get_sportmonks_prematch_odds()
+        
+        # 10. Get in-play odds from Sportmonks
+        self.get_sportmonks_inplay_odds()
         
         logger.info("Complete FDR data collection finished")
 
