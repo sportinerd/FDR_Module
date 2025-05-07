@@ -450,16 +450,15 @@ class FDRDataCollector:
         """Get pre-match odds from Sportmonks API"""
         logger.info("Fetching pre-match odds from Sportmonks")
         
-        odds_base_url = "https://api.sportmonks.com/v3/odds"
+        odds_base_url = "https://api.sportmonks.com/v3/football/odds"
         
         if fixture_id:
             url = f"{odds_base_url}/pre-match/fixtures/{fixture_id}"
-            params = {"include": "market,bookmaker"}
+            params = {"include": "market;bookmaker"}
         else:
             url = f"{odds_base_url}/pre-match"
-            params = {"include": "market,bookmaker,fixture", "per_page": 100}
+            params = {"include": "market;bookmaker;fixture", "per_page": 100}
         
-        # Send the request directly with full URL
         headers = {"Authorization": self.sportmonks_token}
         try:
             response = requests.get(url, headers=headers, params=params)
@@ -475,7 +474,6 @@ class FDRDataCollector:
             logger.error(f"Error fetching pre-match odds from Sportmonks: {str(e)}")
             return []
         
-        # Save to file
         filename = "sportmonks_prematch_odds.json"
         if fixture_id:
             filename = f"sportmonks_prematch_odds_fixture_{fixture_id}.json"
@@ -488,14 +486,14 @@ class FDRDataCollector:
         """Get in-play odds from Sportmonks API"""
         logger.info("Fetching in-play odds from Sportmonks")
         
-        odds_base_url = "https://api.sportmonks.com/v3/odds"
+        odds_base_url = "https://api.sportmonks.com/v3/football/odds"
         
         if fixture_id:
             url = f"{odds_base_url}/inplay/fixtures/{fixture_id}"
-            params = {"include": "market,bookmaker"}
+            params = {"include": "market;bookmaker"}
         else:
             url = f"{odds_base_url}/inplay"
-            params = {"include": "market,bookmaker,fixture", "per_page": 100}
+            params = {"include": "market;bookmaker;fixture", "per_page": 100}
         
         headers = {"Authorization": self.sportmonks_token}
         try:
