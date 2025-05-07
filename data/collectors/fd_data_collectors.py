@@ -446,7 +446,34 @@ class FDRDataCollector:
             logger.error(f"Error parsing fixture odds XML: {str(e)}")
             return None
 
-
+    def get_sportmonks_prematch_odds(self, fixture_id=None):
+        """Get pre-match odds from Sportmonks API"""
+        logger.info("Fetching pre-match odds from Sportmonks")
+        
+        # Base endpoint for pre-match odds
+        if fixture_id:
+            endpoint = f"/odds/pre-match/fixtures/{fixture_id}"
+            params = {"include": "market,bookmaker"}
+        else:
+            endpoint = "/odds/pre-match"
+            params = {"include": "market,bookmaker,fixture", "per_page": 100}
+        
+        response = self.sportmonks_request(endpoint, params)
+        
+        if not response or "data" not in response:
+            logger.error(f"Failed to fetch pre-match odds from Sportmonks")
+            return []
+        
+        odds_data = response["data"]
+        
+        # Save to file
+        filename = "sportmonks_prematch_odds.json"
+        if fixture_id:
+            filename = f"sportmonks_prematch_odds_fixture_{fixture_id}.json"
+        
+        self._save_data(filename, odds_data)
+        logger.info(f"Saved {len(odds_data)} Sportmonks pre-match odds records")
+        return odds_data
     
     def _save_data(self, filename, data):
         """Save data to JSON file"""
