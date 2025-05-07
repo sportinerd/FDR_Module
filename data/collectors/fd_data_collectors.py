@@ -488,28 +488,37 @@ class FDRDataCollector:
         """Get in-play odds from Sportmonks API"""
         logger.info("Fetching in-play odds from Sportmonks")
         
+        odds_base_url = "https://api.sportmonks.com/v3/odds"
+        
         if fixture_id:
-            endpoint = f"/odds/inplay/fixtures/{fixture_id}"
+            url = f"{odds_base_url}/inplay/fixtures/{fixture_id}"
             params = {"include": "market,bookmaker"}
         else:
-            endpoint = "/odds/inplay"
+            url = f"{odds_base_url}/inplay"
             params = {"include": "market,bookmaker,fixture", "per_page": 100}
-    
-        response = self.sportmonks_request(endpoint, params)
-    
-        if not response or "data" not in response:
-            logger.error(f"Failed to fetch in-play odds from Sportmonks")
-            return []
-    
-        odds_data = response["data"]
-    
-        filename = "sportmonks_inplay_odds.json"
-        if fixture_id:
-            filename = f"sportmonks_inplay_odds_fixture_{fixture_id}.json"
         
-        self._save_data(filename, odds_data)
-        logger.info(f"Saved {len(odds_data)} Sportmonks in-play odds records")
-        return odds_data
+        headers = {"Authorization": self.sportmonks_token}
+        try:
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            
+            if "data" not in data:
+                logger.error(f"Failed to fetch in-play odds from Sportmonks")
+                return []
+            
+            odds_data = data["data"]
+            
+            filename = "sportmonks_inplay_odds.json"
+            if fixture_id:
+                filename = f"sportmonks_inplay_odds_fixture_{fixture_id}.json"
+            
+            self._save_data(filename, odds_data)
+            logger.info(f"Saved {len(odds_data)} Sportmonks in-play odds records")
+            return odds_data
+        except Exception as e:
+            logger.error(f"Error fetching in-play odds: {str(e)}")
+            return []
     
     def _save_data(self, filename, data):
         """Save data to JSON file"""
