@@ -475,6 +475,33 @@ class FDRDataCollector:
         logger.info(f"Saved {len(odds_data)} Sportmonks pre-match odds records")
         return odds_data
     
+    def get_sportmonks_inplay_odds(self, fixture_id=None):
+        """Get in-play odds from Sportmonks API"""
+        logger.info("Fetching in-play odds from Sportmonks")
+        
+        if fixture_id:
+            endpoint = f"/odds/inplay/fixtures/{fixture_id}"
+            params = {"include": "market,bookmaker"}
+        else:
+            endpoint = "/odds/inplay"
+            params = {"include": "market,bookmaker,fixture", "per_page": 100}
+    
+        response = self.sportmonks_request(endpoint, params)
+    
+        if not response or "data" not in response:
+            logger.error(f"Failed to fetch in-play odds from Sportmonks")
+            return []
+    
+        odds_data = response["data"]
+    
+        filename = "sportmonks_inplay_odds.json"
+        if fixture_id:
+            filename = f"sportmonks_inplay_odds_fixture_{fixture_id}.json"
+        
+        self._save_data(filename, odds_data)
+        logger.info(f"Saved {len(odds_data)} Sportmonks in-play odds records")
+        return odds_data
+    
     def _save_data(self, filename, data):
         """Save data to JSON file"""
         filepath = os.path.join(self.data_dir, filename)
