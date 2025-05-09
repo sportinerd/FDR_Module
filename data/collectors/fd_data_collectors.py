@@ -7,7 +7,12 @@ import json
 import os
 from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
+from pymongo import MongoClient, UpdateOne, InsertOne
+from pymongo.errors import BulkWriteError
+from pymongo.server_api import ServerApi
+
 load_dotenv()
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -19,19 +24,27 @@ logger = logging.getLogger(__name__)
 class FDRDataCollector:
     """Collect data from Sportmonks and GoalServe for FDR calculations"""
     
-    def __init__(self, sportmonks_token, goalserve_token, data_dir="data"):
+    def __init__(self, sportmonks_token, goalserve_token, mongo_uri=None, data_dir="data"):
         self.sportmonks_token = sportmonks_token
         self.goalserve_token = goalserve_token
         self.data_dir = data_dir
         
-        # Create data directory if it doesn't exist
+        # MongoDB connection
+        if mongo_uri is None:
+            mongo_uri = "mongodb+srv://naymul504:soupnaymul09@pf365.2pguj.mongodb.net/?retryWrites=true&w=majority&appName=pf365"
+        
+        # Initialize MongoDB client and database
+        self.client = MongoClient(mongo_uri, server_api=ServerApi('1'))
+        self.db = self.client['Analytics']
+        
+        # Create data directory if it doesn't exist (for fallback)
         os.makedirs(data_dir, exist_ok=True)
         
         # API endpoints
         self.sportmonks_base_url = "https://api.sportmonks.com/v3/football"
         self.goalserve_base_url = "http://www.goalserve.com/getfeed"
         self.goalserve_outright_url = f"http://oddsfeed.goalserve.com/api/v1/odds/pre-game/outrights/4?k={goalserve_token}"
-        
+    
     def sportmonks_request(self, endpoint, params=None):
         """Make a request to Sportmonks API"""
         url = f"{self.sportmonks_base_url}{endpoint}"
@@ -57,9 +70,78 @@ class FDRDataCollector:
             logger.error(f"Error requesting {url}: {str(e)}")
             return None
     
+    def save_to_mongodb(self, collection_name, data, identifier_field=None, save_local_backup=False):
+        """
+        Save data to MongoDB collection with optional upsert for existing records
+        
+        Args:
+            collection_name: Name of the MongoDB collection
+            data: Data to save (list or single document)
+            identifier_field: Field to use for identifying existing records (for upsert)
+            save_local_backup: Whether to save a local JSON backup file
+        """
+        collection = self.db[collection_name]
+        timestamp = datetime.now()
+
+        # Process differently depending on whether data is a list or single document
+        if isinstance(data, list):
+            if len(data) == 0:
+                logger.info(f"No data to save to {collection_name}")
+                return 0
+            
+            # Add timestamp to all records
+            for item in data:
+                item['last_updated'] = timestamp
+            
+            # Use bulk operations for better performance
+            if identifier_field and identifier_field in data[0]:
+                # Use bulk upsert if we have an identifier field
+                operations = []
+                for item in data:
+                    query = {identifier_field: item[identifier_field]}
+                    operations.append(
+                        UpdateOne(query, {'$set': item}, upsert=True)
+                    )
+                
+                try:
+                    result = collection.bulk_write(operations)
+                    logger.info(f"MongoDB: Upserted {result.upserted_count}, modified {result.modified_count} records in {collection_name}")
+                except BulkWriteError as bwe:
+                    logger.error(f"Bulk write error on {collection_name}: {bwe.details}")
+                    return 0
+            else:
+                # Without identifier, do a simple insert_many
+                try:
+                    result = collection.insert_many(data)
+                    logger.info(f"MongoDB: Inserted {len(result.inserted_ids)} records into {collection_name}")
+                except Exception as e:
+                    logger.error(f"Error inserting into {collection_name}: {str(e)}")
+                    return 0
+        else:
+            # Single document
+            data['last_updated'] = timestamp
+            
+            if identifier_field and identifier_field in data:
+                query = {identifier_field: data[identifier_field]}
+                result = collection.update_one(query, {'$set': data}, upsert=True)
+                logger.info(f"MongoDB: {'Inserted' if result.upserted_id else 'Updated'} document in {collection_name}")
+            else:
+                result = collection.insert_one(data)
+                logger.info(f"MongoDB: Inserted document into {collection_name} with ID {result.inserted_id}")
+        
+        # Optionally save local backup
+        if save_local_backup:
+            filepath = os.path.join(self.data_dir, f"{collection_name}.json")
+            with open(filepath, 'w') as f:
+                json.dump(data, f, indent=2)
+            logger.info(f"Saved local backup to {filepath}")
+        
+        return len(data) if isinstance(data, list) else 1
+    
     def get_leagues(self):
         """Get all leagues with country information"""
         logger.info("Fetching leagues data")
+        
         response = self.sportmonks_request("/leagues", {
             "include": "country",
             "per_page": 150
@@ -70,13 +152,17 @@ class FDRDataCollector:
             return []
         
         leagues = response["data"]
-        self._save_data("leagues.json", leagues)
+        
+        # Save to MongoDB
+        self.save_to_mongodb("leagues", leagues, identifier_field="id")
+        
         logger.info(f"Saved {len(leagues)} leagues")
         return leagues
     
     def get_teams_by_league(self, league_id):
         """Get all teams for a league"""
         logger.info(f"Fetching teams for league ID {league_id}")
+        
         response = self.sportmonks_request("/teams", {
             "filters": f"leagueIds:{league_id}",
             "per_page": 100
@@ -87,7 +173,14 @@ class FDRDataCollector:
             return []
         
         teams = response["data"]
-        self._save_data(f"teams_league_{league_id}.json", teams)
+        
+        # Add league_id to each team document
+        for team in teams:
+            team['league_id'] = league_id
+        
+        # Save to MongoDB
+        self.save_to_mongodb("teams", teams, identifier_field="id")
+        
         logger.info(f"Saved {len(teams)} teams for league {league_id}")
         return teams
     
@@ -126,14 +219,20 @@ class FDRDataCollector:
             
             # Only include completed matches
             matches = [m for m in fixtures if m.get("state_id") == 5]
-            all_matches.extend(matches)
             
+            # Add league_id to each match
+            for match in matches:
+                match['league_id'] = league_id
+                match['season_id'] = season_id
+            
+            all_matches.extend(matches)
             logger.info(f"Found {len(matches)} completed matches for season {season_id}")
         
-        self._save_data(f"historical_matches_league_{league_id}.json", all_matches)
+        # Save to MongoDB
+        self.save_to_mongodb("historicalMatches", all_matches, identifier_field="id")
+        
         logger.info(f"Saved {len(all_matches)} historical matches for league {league_id}")
         return all_matches
-
     
     def get_upcoming_fixtures(self, days_ahead=14):
         """Get upcoming fixtures for next N days with odds"""
@@ -142,7 +241,6 @@ class FDRDataCollector:
         
         logger.info(f"Fetching upcoming fixtures from {today} to {future}")
         
-        # Add 'f' before the string to make it an f-string
         response = self.sportmonks_request(f"/fixtures/between/{today}/{future}", {
             "include": "participants;odds;league",
             "per_page": 200
@@ -153,10 +251,12 @@ class FDRDataCollector:
             return []
         
         fixtures = response["data"]
-        self._save_data("upcoming_fixtures.json", fixtures)
+        
+        # Save to MongoDB
+        self.save_to_mongodb("fixtures", fixtures, identifier_field="id")
+        
         logger.info(f"Saved {len(fixtures)} upcoming fixtures")
         return fixtures
-
     
     def get_player_availability(self):
         """Get player injuries and suspensions using the teams endpoint with sidelined data"""
@@ -175,8 +275,7 @@ class FDRDataCollector:
         teams = teams_response["data"]
         
         # Process sidelined data
-        injuries = []
-        suspensions = []
+        player_availability = []
         
         for team in teams:
             team_id = team["id"]
@@ -195,34 +294,29 @@ class FDRDataCollector:
                         "player_id": player_id,
                         "team_id": team_id,
                         "team_name": team_name,
+                        "category": category,
                         "start_date": start_date,
                         "end_date": end_date,
                         "games_missed": sidelined["games_missed"],
                         "completed": sidelined["completed"]
                     }
                     
-                    # Categorize as injury or suspension
-                    if category == "injury":
-                        injuries.append(availability_record)
-                    else:
-                        suspensions.append(availability_record)
+                    player_availability.append(availability_record)
         
-        # Combine data
-        availability_data = {
-            "injuries": injuries,
-            "suspensions": suspensions
-        }
+        # Save to MongoDB
+        self.save_to_mongodb("playerAvailability", player_availability, identifier_field="player_id")
         
-        self._save_data("player_availability.json", availability_data)
-        logger.info(f"Saved player availability data: {len(injuries)} injuries, {len(suspensions)} suspensions")
-        return availability_data
-
+        # Count injuries and suspensions for logging
+        injuries = sum(1 for item in player_availability if item.get("category") == "injury")
+        suspensions = sum(1 for item in player_availability if item.get("category") != "injury")
+        
+        logger.info(f"Saved player availability data: {injuries} injuries, {suspensions} suspensions")
+        return player_availability
     
     def get_predictions(self, league_id=None, fixture_id=None):
         """Get match predictions from Sportmonks"""
         logger.info("Fetching predictions data")
         
-        # Base endpoint is different than what you're using
         if fixture_id:
             # For specific fixture
             endpoint = f"/predictions/probabilities/fixtures/{fixture_id}"
@@ -241,16 +335,12 @@ class FDRDataCollector:
             return []
         
         predictions = response["data"]
-        filename = "predictions.json"
-        if fixture_id:
-            filename = f"predictions_fixture_{fixture_id}.json"
-        elif league_id:
-            filename = f"predictions_league_{league_id}.json"
         
-        self._save_data(filename, predictions)
+        # Save to MongoDB
+        self.save_to_mongodb("predictions", predictions, identifier_field="id")
+        
         logger.info(f"Saved {len(predictions)} predictions")
         return predictions
-
     
     def get_rivals(self):
         """Get team rivalries (for derby identification)"""
@@ -263,7 +353,10 @@ class FDRDataCollector:
             return []
         
         rivals = response["data"]
-        self._save_data("rivals.json", rivals)
+        
+        # Save to MongoDB
+        self.save_to_mongodb("rivals", rivals, identifier_field="id")
+        
         logger.info(f"Saved {len(rivals)} rivalry records")
         return rivals
     
@@ -276,44 +369,55 @@ class FDRDataCollector:
             response.raise_for_status()
             xml_data = response.text
             
-            # Save raw XML 
-            with open(os.path.join(self.data_dir, "goalserve_outright_odds.xml"), "w") as f:
-                f.write(xml_data)
-            
             # Parse XML to structured data
             import xml.etree.ElementTree as ET
             root = ET.fromstring(xml_data)
             
-            # Extract data similar to example in search result #1
             outright_odds = []
+            
             for category in root.findall('category'):
                 category_name = category.get('name')
+                
                 for outrights in category.findall('outrights'):
                     for market in outrights.findall('market'):
                         market_name = market.get('name')
+                        market_id = market.get('id')
+                        
                         for sel in market.findall('sel'):
                             team_name = sel.get('name')
+                            team_id = sel.get('id')
+                            
                             odds_list = []
+                            
                             for bookmaker in sel.findall('bookmaker'):
                                 bookmaker_name = bookmaker.get('name')
+                                bookmaker_id = bookmaker.get('id')
                                 odd_value = bookmaker.find('odd').get('value')
-                                odds_list.append({'bookmaker': bookmaker_name, 'odd': float(odd_value)})
+                                
+                                odds_list.append({
+                                    'bookmaker': bookmaker_name,
+                                    'bookmaker_id': bookmaker_id,
+                                    'odd': float(odd_value)
+                                })
+                            
                             outright_odds.append({
                                 'category': category_name,
                                 'market': market_name,
+                                'market_id': market_id,
                                 'team': team_name,
+                                'team_id': team_id,
                                 'odds': odds_list
                             })
             
-            # Save structured data as JSON
-            self._save_data("goalserve_outright_odds_parsed.json", outright_odds)
+            # Save to MongoDB
+            self.save_to_mongodb("outrightOdds", outright_odds)
+            
             logger.info(f"Saved outright odds data: {len(outright_odds)} records")
             return outright_odds
             
         except Exception as e:
             logger.error(f"Error fetching outright odds: {str(e)}")
             return None
-
     
     def get_goalserve_fixture_odds(self):
         """Get fixture odds from GoalServe"""
@@ -326,10 +430,6 @@ class FDRDataCollector:
         if not xml_response:
             logger.error("Failed to fetch fixture odds")
             return None
-        
-        # Save raw XML
-        with open(os.path.join(self.data_dir, "goalserve_fixture_odds.xml"), "w") as f:
-            f.write(xml_response)
         
         # Parse XML
         try:
@@ -347,7 +447,7 @@ class FDRDataCollector:
                 matches_elem = category.find('matches')
                 if matches_elem is None:
                     continue
-                    
+                
                 for match in matches_elem.findall('match'):
                     match_id = match.get('id')
                     match_date = match.get('date')
@@ -360,7 +460,7 @@ class FDRDataCollector:
                     
                     if local_team is None or visitor_team is None:
                         continue
-                        
+                    
                     local_team_name = local_team.get('name')
                     local_team_id = local_team.get('id')
                     visitor_team_name = visitor_team.get('name')
@@ -437,15 +537,16 @@ class FDRDataCollector:
                     if match_odds['odds']:
                         fixture_odds.append(match_odds)
             
-            # Save structured data
-            self._save_data("goalserve_fixture_odds_parsed.json", fixture_odds)
+            # Save to MongoDB
+            self.save_to_mongodb("fixtureOdds", fixture_odds, identifier_field="match_id")
+            
             logger.info(f"Saved fixture odds data: {len(fixture_odds)} records")
             return fixture_odds
             
         except Exception as e:
             logger.error(f"Error parsing fixture odds XML: {str(e)}")
             return None
-
+    
     def get_sportmonks_prematch_odds(self, fixture_id=None):
         """Get pre-match odds from Sportmonks API"""
         logger.info("Fetching pre-match odds from Sportmonks")
@@ -470,17 +571,16 @@ class FDRDataCollector:
                 return []
             
             odds_data = data["data"]
+            
+            # Save to MongoDB
+            self.save_to_mongodb("sportmonksPrematchOdds", odds_data, identifier_field="id")
+            
+            logger.info(f"Saved {len(odds_data)} Sportmonks pre-match odds records")
+            return odds_data
+            
         except Exception as e:
             logger.error(f"Error fetching pre-match odds from Sportmonks: {str(e)}")
             return []
-        
-        filename = "sportmonks_prematch_odds.json"
-        if fixture_id:
-            filename = f"sportmonks_prematch_odds_fixture_{fixture_id}.json"
-        
-        self._save_data(filename, odds_data)
-        logger.info(f"Saved {len(odds_data)} Sportmonks pre-match odds records")
-        return odds_data
     
     def get_sportmonks_inplay_odds(self, fixture_id=None):
         """Get in-play odds from Sportmonks API"""
@@ -507,22 +607,15 @@ class FDRDataCollector:
             
             odds_data = data["data"]
             
-            filename = "sportmonks_inplay_odds.json"
-            if fixture_id:
-                filename = f"sportmonks_inplay_odds_fixture_{fixture_id}.json"
+            # Save to MongoDB
+            self.save_to_mongodb("sportmonksInplayOdds", odds_data, identifier_field="id")
             
-            self._save_data(filename, odds_data)
             logger.info(f"Saved {len(odds_data)} Sportmonks in-play odds records")
             return odds_data
+            
         except Exception as e:
             logger.error(f"Error fetching in-play odds: {str(e)}")
             return []
-    
-    def _save_data(self, filename, data):
-        """Save data to JSON file"""
-        filepath = os.path.join(self.data_dir, filename)
-        with open(filepath, 'w') as f:
-            json.dump(data, f, indent=2)
     
     def collect_all_fdr_data(self, major_league_ids=None):
         """Collect all data needed for FDR calculation"""
@@ -531,8 +624,7 @@ class FDRDataCollector:
         # 1. Get all leagues
         leagues = self.get_leagues()
         
-        # Determine which leagues are major based on data availability 
-        # This replaces static classification
+        # Determine which leagues are major based on data availability
         if not major_league_ids:
             major_league_ids = []
             for league in leagues:
@@ -550,15 +642,18 @@ class FDRDataCollector:
             # Store major/smaller classification
             league["is_major"] = is_major
             
+            # Update league with major classification
+            self.db.leagues.update_one(
+                {"id": league_id},
+                {"$set": {"is_major": is_major}}
+            )
+            
             # Get teams
             self.get_teams_by_league(league_id)
             
             # Get historical matches (more seasons for major leagues)
-            seasons = 2
+            seasons = 10 if is_major else 5
             self.get_historical_matches(league_id, seasons)
-        
-        # Update leagues with classification
-        self._save_data("leagues.json", leagues)
         
         # 3. Get upcoming fixtures with odds
         self.get_upcoming_fixtures()
@@ -588,9 +683,10 @@ class FDRDataCollector:
 
 # Usage example
 if __name__ == "__main__":
-    # Replace with your actual API tokens
+    # Get API tokens from environment variables
     sportmonks_token = os.getenv("SPORTMONKS_API_KEY")
-    goalserve_token = os.getenv("GOALSERVE_API_KEY")
+    goalserve_token = os.getenv("GOALSERVE_API_KEY", "0f6230689b674453eee508dd50f5b2ca")
     
+    # MongoDB URI is directly configured in the class
     collector = FDRDataCollector(sportmonks_token, goalserve_token)
     collector.collect_all_fdr_data()
