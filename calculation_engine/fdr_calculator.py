@@ -42,12 +42,13 @@ class FDRCalculator:
         
         # Category ranges
         self.category_ranges = {
-            (0, 2): "EASIEST",
-            (3, 4): "EASIER", 
-            (5, 6): "AVERAGE",
-            (7, 8): "TOUGH",
+            (0, 2.99): "EASIEST",
+            (3, 4.99): "EASIER", 
+            (5, 6.99): "AVERAGE",
+            (7, 8.99): "TOUGH",
             (9, 10): "TOUGHEST"
         }
+
     
     def calculate_all_fixtures(self, days_ahead=14):
         """Calculate FDR for all upcoming fixtures"""
@@ -139,38 +140,36 @@ class FDRCalculator:
         
         # Apply weights based on league type
         if is_major:
-            # Major league formula (25%, 15%, 20%, 30%, 10%)
             home_fdr_raw = (
-                0.25 * home_historical +
-                0.15 * home_form +
-                0.20 * home_outright +
-                0.30 * home_odds +
-                0.10 * home_availability
+                0.20 * home_historical +  # Historical: 20%
+                0.20 * home_form +        # Recent Form: 20%
+                0.15 * home_outright +    # Outright: 15%
+                0.40 * home_odds +        # Fix Odds: 40%
+                0.05 * home_availability  # Player Availability: 5%
             )
             
             away_fdr_raw = (
-                0.25 * away_historical +
-                0.15 * away_form +
-                0.20 * away_outright +
-                0.30 * away_odds +
-                0.10 * away_availability
+                0.20 * away_historical +
+                0.20 * away_form +
+                0.15 * away_outright +
+                0.40 * away_odds +
+                0.05 * away_availability
             )
         else:
             # Smaller league formula (35%, 15%, 0%, 30%, 20%)
             home_fdr_raw = (
-                0.35 * home_historical +
-                0.15 * home_form +
-                0.30 * home_odds +
-                0.20 * home_availability
+                0.30 * home_historical +  # Increased historical importance
+                0.20 * home_form +
+                0.40 * home_odds +
+                0.10 * home_availability  # Slightly increased for smaller leagues
             )
             
             away_fdr_raw = (
-                0.35 * away_historical +
-                0.15 * away_form +
-                0.30 * away_odds +
-                0.20 * away_availability
+                0.30 * away_historical +
+                0.20 * away_form +
+                0.40 * away_odds +
+                0.10 * away_availability
             )
-        
         # Scale FDR to 0-10 range
         home_fdr = self.scale_to_range(home_fdr_raw)
         away_fdr = self.scale_to_range(away_fdr_raw)
@@ -353,7 +352,10 @@ class FDRCalculator:
         
         # If there are no historical matches, return moderate difficulty
         if weighted_matches == 0:
-            return 0.5, 0.5
+            # Generate slightly different values based on team IDs for variety
+            home_value = 0.45 + (home_team_id % 10) / 100
+            away_value = 0.45 + (away_team_id % 10) / 100
+            return min(0.65, home_value), min(0.65, away_value)
         
         # Calculate weighted win rates
         home_win_rate = home_wins / weighted_matches
@@ -645,12 +647,65 @@ class FDRCalculator:
     
     def get_fdr_category(self, score):
         """Get the FDR category based on the score"""
-        for (low, high), category in self.category_ranges.items():
-            if low <= score <= high:
-                return category
+        if score <= 2.99:
+            return "EASIEST"
+        elif score <= 4.99:
+            return "EASIER"
+        elif score <= 6.99:
+            return "AVERAGE"
+        elif score <= 8.99:
+            return "TOUGH"
+        else:
+            return "TOUGHEST"
+
+    
+    def generate_match_summaries(self, days_ahead=14):
+        """Generate simplified match summaries with FDR ratings"""
+        start_date = datetime.now().strftime("%Y-%m-%d")
+        end_date = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
         
-        # Default to TOUGHEST for scores > 10
-        return "TOUGHEST"
+        fixtures = self.db.fixtures.find({
+            "starting_at": {"$gte": start_date}
+        })
+        
+        summaries = []
+        for fixture in fixtures:
+            try:
+                # Calculate FDR if not already calculated
+                if "fdr" not in fixture:
+                    self.calculate_fixture_fdr(fixture)
+                    # Fetch the updated fixture with FDR data
+                    fixture = self.db.fixtures.find_one({"_id": fixture["_id"]})
+                
+                if "fdr" not in fixture:
+                    continue
+                    
+                # Get team names
+                home_team = ""
+                away_team = ""
+                if "participants" in fixture and len(fixture["participants"]) >= 2:
+                    home_team = fixture["participants"][0].get("name", "Home")
+                    away_team = fixture["participants"][1].get("name", "Away")
+                
+                # Get FDR categories AND numerical values
+                home_fdr = fixture["fdr"]["overall"]["home"]["fdr"]
+                away_fdr = fixture["fdr"]["overall"]["away"]["fdr"]
+                home_category = fixture["fdr"]["overall"]["home"]["category"].lower()
+                away_category = fixture["fdr"]["overall"]["away"]["category"].lower()
+                
+                # Format the summary including numerical values
+                summary = f"{home_team} vs {away_team}\nfdr h {home_category} ({home_fdr:.1f}) - a {away_category} ({away_fdr:.1f})"
+                summaries.append(summary)
+                
+                # Print and also return the summaries
+                print(summary)
+                print("---")
+            except Exception as e:
+                continue
+        
+        return summaries
+
+
 
 
 # Usage example
@@ -660,3 +715,4 @@ if __name__ == "__main__":
     
     # Calculate FDR for all upcoming fixtures
     calculator.calculate_all_fixtures(days_ahead=14)
+    calculator.generate_match_summaries(days_ahead=14)
