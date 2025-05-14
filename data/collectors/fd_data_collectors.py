@@ -781,7 +781,56 @@ class FDRDataCollector:
         
         logger.info(f"Created mapping: GoalServe ID {goalserve_id} → Sportmonks ID {sportmonks_id}")
 
-    
+    def get_sportmonks_scoreline_probabilities(self):
+        """Get scoreline probabilities from Sportmonks Predictions API"""
+        logger.info("Fetching scoreline probabilities from Sportmonks")
+        
+        endpoint = "/predictions/probabilities"
+        params = {
+            "include": "type",
+            "per_page": 150
+        }
+        
+        response = self.sportmonks_request(endpoint, params)
+        
+        if not response or "data" not in response:
+            logger.error("Failed to fetch scoreline probabilities")
+            return []
+        
+        probabilities = response["data"]
+        scoreline_probs = []
+        
+        for prob in probabilities:
+            if prob.get("type_id") == 240:  # Correct Score Probability
+                fixture_id = prob.get("fixture_id")
+                prediction = prob.get("predictions", {})
+                
+                # Check if 'scores' exists in prediction
+                if "scores" in prediction:
+                    # Process each scoreline in the scores object
+                    for scoreline, probability in prediction["scores"].items():
+                        if "-" in scoreline:
+                            home_goals, away_goals = scoreline.split("-")
+                            try:
+                                scoreline_probs.append({
+                                    "fixture_id": fixture_id,
+                                    "home_goals": int(home_goals),
+                                    "away_goals": int(away_goals),
+                                    "probability": float(probability)
+                                })
+                            except (ValueError, TypeError):
+                                logger.warning(f"Invalid scoreline format: {scoreline} with probability {probability}")
+        
+        # Save to MongoDB
+        if scoreline_probs:
+            self.save_to_mongodb("scorelineProbabilities", scoreline_probs)
+            logger.info(f"Saved {len(scoreline_probs)} scoreline probabilities")
+        else:
+            logger.warning("No valid scoreline probabilities found to save")
+        
+        return scoreline_probs
+
+
     def collect_all_fdr_data(self, major_league_ids=None):
         """Collect all data needed for FDR calculation"""
         logger.info("Starting complete FDR data collection")
@@ -855,4 +904,4 @@ if __name__ == "__main__":
     # MongoDB URI is directly configured in the class
     collector = FDRDataCollector(sportmonks_token, goalserve_token)
     # collector.collect_all_fdr_data()
-    collector.get_goalserve_fixture_odds()
+    collector.get_sportmonks_scoreline_probabilities()
