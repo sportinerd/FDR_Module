@@ -420,57 +420,52 @@ class FDRDataCollector:
             return None
     
     def get_goalserve_fixture_odds(self):
-        """Get fixture odds from GoalServe"""
+        """Get fixture odds from GoalServe with Sportmonks ID mapping"""
         logger.info("Fetching fixture odds from GoalServe")
-        
         endpoint = "getodds/soccer"
         params = {"cat": "soccer_10"}
-        
         xml_response = self.goalserve_request(endpoint, params)
+        
         if not xml_response:
             logger.error("Failed to fetch fixture odds")
             return None
-        
-        # Parse XML
+
+        import xml.etree.ElementTree as ET
         try:
-            import xml.etree.ElementTree as ET
             root = ET.fromstring(xml_response)
-            
             fixture_odds = []
-            
-            # Process each category (league)
+
             for category in root.findall('category'):
                 category_name = category.get('name')
                 category_id = category.get('id')
-                
-                # Process matches in this category
+
                 matches_elem = category.find('matches')
                 if matches_elem is None:
                     continue
-                
+
                 for match in matches_elem.findall('match'):
                     match_id = match.get('id')
                     match_date = match.get('date')
                     match_time = match.get('time')
                     match_status = match.get('status')
-                    
-                    # Get teams
+
                     local_team = match.find('localteam')
                     visitor_team = match.find('visitorteam')
-                    
+
                     if local_team is None or visitor_team is None:
                         continue
-                    
+
                     local_team_name = local_team.get('name')
-                    local_team_id = local_team.get('id')
                     visitor_team_name = visitor_team.get('name')
-                    visitor_team_id = visitor_team.get('id')
-                    
-                    # Get odds
-                    odds_elem = match.find('odds')
-                    if odds_elem is None:
-                        continue
-                    
+
+                    # Find matching Sportmonks fixture
+                    sportmonks_fixture = self.db.fixtures.find_one({
+                        "participants.name": {
+                            "$all": [local_team_name, visitor_team_name]
+                        },
+                        "starting_at": {"$regex": f"^{match_date}"}
+                    })
+
                     match_odds = {
                         'match_id': match_id,
                         'category_name': category_name,
@@ -479,73 +474,74 @@ class FDRDataCollector:
                         'match_time': match_time,
                         'match_status': match_status,
                         'local_team': {
-                            'id': local_team_id,
-                            'name': local_team_name
+                            'name': local_team_name,
+                            'id': local_team.get('id')
                         },
                         'visitor_team': {
-                            'id': visitor_team_id,
-                            'name': visitor_team_name
+                            'name': visitor_team_name,
+                            'id': visitor_team.get('id')
                         },
                         'odds': []
                     }
-                    
-                    # Process odds by type (focusing on Match Winner for FDR calculations)
-                    for odds_type in odds_elem.findall('type'):
-                        type_value = odds_type.get('value')
-                        type_id = odds_type.get('id')
-                        
-                        bookmakers_data = []
-                        
-                        for bookmaker in odds_type.findall('bookmaker'):
-                            bookmaker_name = bookmaker.get('name')
-                            bookmaker_id = bookmaker.get('id')
-                            
-                            # Extract home, draw, away odds
-                            home_odd = None
-                            draw_odd = None
-                            away_odd = None
-                            
-                            for odd in bookmaker.findall('odd'):
-                                odd_name = odd.get('name')
-                                odd_value = odd.get('value')
+
+                    if sportmonks_fixture:
+                        match_odds["sportmonks_id"] = sportmonks_fixture["id"]
+                        match_odds["match_date"] = sportmonks_fixture["starting_at"] 
+                        logger.debug(f"Mapped GoalServe ID {match_id} to Sportmonks ID {sportmonks_fixture['id']}")
+                    else:
+                        logger.warning(f"No Sportmonks fixture found for {local_team_name} vs {visitor_team_name} on {match_date}")
+
+                    # Process odds data
+                    odds_elem = match.find('odds')
+                    if odds_elem is not None:
+                        for odds_type in odds_elem.findall('type'):
+                            type_value = odds_type.get('value')
+                            type_id = odds_type.get('id')
+                            bookmakers_data = []
+
+                            for bookmaker in odds_type.findall('bookmaker'):
+                                bookmaker_name = bookmaker.get('name')
+                                bookmaker_id = bookmaker.get('id')
                                 
-                                if odd_name == "Home":
-                                    home_odd = float(odd_value)
-                                elif odd_name == "Draw":
-                                    draw_odd = float(odd_value)
-                                elif odd_name == "Away":
-                                    away_odd = float(odd_value)
-                            
-                            # Only add complete sets of odds
-                            if type_value == "Match Winner" and home_odd and draw_odd and away_odd:
-                                bookmakers_data.append({
+                                odds = {
                                     'bookmaker_id': bookmaker_id,
                                     'bookmaker_name': bookmaker_name,
-                                    'home_odd': home_odd,
-                                    'draw_odd': draw_odd,
-                                    'away_odd': away_odd
+                                    'home_odd': None,
+                                    'draw_odd': None,
+                                    'away_odd': None
+                                }
+
+                                for odd in bookmaker.findall('odd'):
+                                    odd_name = odd.get('name')
+                                    odd_value = odd.get('value')
+                                    if odd_name == "Home":
+                                        odds['home_odd'] = float(odd_value)
+                                    elif odd_name == "Draw":
+                                        odds['draw_odd'] = float(odd_value)
+                                    elif odd_name == "Away":
+                                        odds['away_odd'] = float(odd_value)
+
+                                if all([odds['home_odd'], odds['draw_odd'], odds['away_odd']]):
+                                    bookmakers_data.append(odds)
+
+                            if bookmakers_data:
+                                match_odds['odds'].append({
+                                    'type_id': type_id,
+                                    'type_value': type_value,
+                                    'bookmakers': bookmakers_data
                                 })
-                        
-                        if bookmakers_data:
-                            match_odds['odds'].append({
-                                'type_id': type_id,
-                                'type_value': type_value,
-                                'bookmakers': bookmakers_data
-                            })
-                    
-                    # Only add matches with valid odds data
+
                     if match_odds['odds']:
                         fixture_odds.append(match_odds)
-            
-            # Save to MongoDB
+
             self.save_to_mongodb("fixtureOdds", fixture_odds, identifier_field="match_id")
-            
-            logger.info(f"Saved fixture odds data: {len(fixture_odds)} records")
+            logger.info(f"Saved {len(fixture_odds)} fixture odds records with Sportmonks mappings")
             return fixture_odds
-            
+
         except Exception as e:
             logger.error(f"Error parsing fixture odds XML: {str(e)}")
             return None
+
     
     def get_sportmonks_prematch_odds(self, fixture_id=None):
         """Get pre-match odds from Sportmonks API"""
@@ -690,3 +686,4 @@ if __name__ == "__main__":
     # MongoDB URI is directly configured in the class
     collector = FDRDataCollector(sportmonks_token, goalserve_token)
     collector.collect_all_fdr_data()
+    # collector.get_goalserve_fixture_odds(match_id="6097594")
