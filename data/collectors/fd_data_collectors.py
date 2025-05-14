@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 from pymongo import MongoClient, UpdateOne, InsertOne
 from pymongo.errors import BulkWriteError
 from pymongo.server_api import ServerApi
+from fuzzywuzzy import fuzz, process
+import re
+from datetime import datetime
 
 load_dotenv()
 
@@ -420,52 +423,75 @@ class FDRDataCollector:
             return None
     
     def get_goalserve_fixture_odds(self):
-        """Get fixture odds from GoalServe with Sportmonks ID mapping"""
+        """Get fixture odds from GoalServe with improved Sportmonks ID mapping"""
         logger.info("Fetching fixture odds from GoalServe")
+        
         endpoint = "getodds/soccer"
         params = {"cat": "soccer_10"}
-        xml_response = self.goalserve_request(endpoint, params)
         
+        xml_response = self.goalserve_request(endpoint, params)
         if not xml_response:
             logger.error("Failed to fetch fixture odds")
             return None
-
+        
         import xml.etree.ElementTree as ET
+        
         try:
             root = ET.fromstring(xml_response)
             fixture_odds = []
-
+            mapped_count = 0
+            
+            # Create a cache of upcoming fixtures for faster lookup
+            upcoming_fixtures = list(self.db.fixtures.find({
+                "starting_at": {"$gte": datetime.now().strftime("%Y-%m-%d")}
+            }))
+            logger.info(f"Loaded {len(upcoming_fixtures)} upcoming fixtures for mapping")
+            
             for category in root.findall('category'):
                 category_name = category.get('name')
                 category_id = category.get('id')
-
+                
                 matches_elem = category.find('matches')
                 if matches_elem is None:
                     continue
-
+                    
                 for match in matches_elem.findall('match'):
                     match_id = match.get('id')
                     match_date = match.get('date')
                     match_time = match.get('time')
                     match_status = match.get('status')
-
+                    
                     local_team = match.find('localteam')
                     visitor_team = match.find('visitorteam')
-
+                    
                     if local_team is None or visitor_team is None:
                         continue
-
+                        
                     local_team_name = local_team.get('name')
                     visitor_team_name = visitor_team.get('name')
-
-                    # Find matching Sportmonks fixture
-                    sportmonks_fixture = self.db.fixtures.find_one({
-                        "participants.name": {
-                            "$all": [local_team_name, visitor_team_name]
-                        },
-                        "starting_at": {"$regex": f"^{match_date}"}
-                    })
-
+                    
+                    # Check for existing mapping first
+                    existing_mapping = self.db.fixture_id_mapping.find_one({"goalserve_id": match_id})
+                    sportmonks_id = None
+                    
+                    if existing_mapping:
+                        sportmonks_id = existing_mapping["sportmonks_id"]
+                    else:
+                        # Find matching fixture
+                        matching_fixture = self.find_matching_fixture(
+                            local_team_name, 
+                            visitor_team_name,
+                            match_date,
+                            category_name,
+                            match_time
+                        )
+                        
+                        if matching_fixture:
+                            sportmonks_id = matching_fixture["id"]
+                            # Create mapping for future use
+                            self.update_fixture_mapping(match_id, sportmonks_id)
+                            mapped_count += 1
+                    
                     match_odds = {
                         'match_id': match_id,
                         'category_name': category_name,
@@ -483,22 +509,20 @@ class FDRDataCollector:
                         },
                         'odds': []
                     }
-
-                    if sportmonks_fixture:
-                        match_odds["sportmonks_id"] = sportmonks_fixture["id"]
-                        match_odds["match_date"] = sportmonks_fixture["starting_at"] 
-                        logger.debug(f"Mapped GoalServe ID {match_id} to Sportmonks ID {sportmonks_fixture['id']}")
+                    
+                    if sportmonks_id:
+                        match_odds["sportmonks_id"] = sportmonks_id
                     else:
                         logger.warning(f"No Sportmonks fixture found for {local_team_name} vs {visitor_team_name} on {match_date}")
-
+                    
                     # Process odds data
                     odds_elem = match.find('odds')
                     if odds_elem is not None:
                         for odds_type in odds_elem.findall('type'):
                             type_value = odds_type.get('value')
                             type_id = odds_type.get('id')
+                            
                             bookmakers_data = []
-
                             for bookmaker in odds_type.findall('bookmaker'):
                                 bookmaker_name = bookmaker.get('name')
                                 bookmaker_id = bookmaker.get('id')
@@ -510,37 +534,40 @@ class FDRDataCollector:
                                     'draw_odd': None,
                                     'away_odd': None
                                 }
-
+                                
                                 for odd in bookmaker.findall('odd'):
                                     odd_name = odd.get('name')
                                     odd_value = odd.get('value')
+                                    
                                     if odd_name == "Home":
                                         odds['home_odd'] = float(odd_value)
                                     elif odd_name == "Draw":
                                         odds['draw_odd'] = float(odd_value)
                                     elif odd_name == "Away":
                                         odds['away_odd'] = float(odd_value)
-
+                                        
                                 if all([odds['home_odd'], odds['draw_odd'], odds['away_odd']]):
                                     bookmakers_data.append(odds)
-
+                                    
                             if bookmakers_data:
                                 match_odds['odds'].append({
                                     'type_id': type_id,
                                     'type_value': type_value,
                                     'bookmakers': bookmakers_data
                                 })
-
+                    
                     if match_odds['odds']:
                         fixture_odds.append(match_odds)
-
+            
             self.save_to_mongodb("fixtureOdds", fixture_odds, identifier_field="match_id")
-            logger.info(f"Saved {len(fixture_odds)} fixture odds records with Sportmonks mappings")
+            logger.info(f"Saved {len(fixture_odds)} fixture odds records with {mapped_count} new Sportmonks mappings")
+            
             return fixture_odds
-
+            
         except Exception as e:
             logger.error(f"Error parsing fixture odds XML: {str(e)}")
             return None
+
 
     
     def get_sportmonks_prematch_odds(self, fixture_id=None):
@@ -612,6 +639,148 @@ class FDRDataCollector:
         except Exception as e:
             logger.error(f"Error fetching in-play odds: {str(e)}")
             return []
+    
+    def normalize_team_name(self, name):
+        """Normalize team names for better matching"""
+        if not name:
+            return ""
+        
+        # Convert to lowercase
+        name = name.lower()
+        
+        # Remove common suffixes
+        suffixes = [" fc", " cf", " united", " utd", " city", " athletic", " academy", 
+                    " u21", " u23", " u19", " reserves", " ladies", " women"]
+        for suffix in suffixes:
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+        
+        # Remove special characters and extra spaces
+        name = re.sub(r'[^\w\s]', ' ', name)
+        name = re.sub(r'\s+', ' ', name).strip()
+        
+        return name
+
+    def normalize_date(self, date_str):
+        """Convert various date formats to YYYY-MM-DD"""
+        if not date_str:
+            return None
+            
+        # Handle "May 14" format
+        match = re.match(r"(\w+)\s+(\d+)", date_str)
+        if match:
+            month_name, day = match.groups()
+            current_year = datetime.now().year
+            try:
+                date_obj = datetime.strptime(f"{month_name} {day} {current_year}", "%b %d %Y")
+                # If date is in the past by more than a week, it might be next year
+                if (datetime.now() - date_obj).days > 7:
+                    date_obj = datetime.strptime(f"{month_name} {day} {current_year+1}", "%b %d %Y")
+                return date_obj.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        
+        # Already in ISO format
+        if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+            return date_str
+            
+        return None
+
+    def find_matching_fixture(self, local_team, visitor_team, match_date, category_name=None, match_time=None):
+        """Find matching fixture in Sportmonks data using multiple criteria"""
+        # Normalize team names
+        norm_local = self.normalize_team_name(local_team)
+        norm_visitor = self.normalize_team_name(visitor_team)
+        
+        # Normalize date
+        normalized_date = self.normalize_date(match_date)
+        if not normalized_date:
+            logger.warning(f"Could not normalize date: {match_date}")
+            return None
+        
+        # Build query - start with date match
+        query = {"starting_at": {"$regex": f"^{normalized_date}"}}
+        
+        # Add league filter if available
+        if category_name:
+            # Extract main league name from category
+            league_name = category_name.split(":")[-1].strip() if ":" in category_name else category_name
+            query["$or"] = [
+                {"league.name": {"$regex": league_name, "$options": "i"}},
+                {"league.short_code": {"$regex": league_name, "$options": "i"}}
+            ]
+        
+        # Find potential matches
+        potential_matches = list(self.db.fixtures.find(query))
+        
+        if not potential_matches:
+            return None
+        
+        # Score each potential match
+        best_score = 0
+        best_match = None
+        
+        for fixture in potential_matches:
+            # Skip fixtures without participants
+            if "participants" not in fixture or len(fixture["participants"]) < 2:
+                continue
+            
+            # Get team names from fixture
+            home_name = self.normalize_team_name(fixture["participants"][0].get("name", ""))
+            away_name = self.normalize_team_name(fixture["participants"][1].get("name", ""))
+            
+            # Calculate name similarity scores
+            home_local_score = fuzz.ratio(home_name, norm_local)
+            away_visitor_score = fuzz.ratio(away_name, norm_visitor)
+            
+            # Also check reversed (in case teams are swapped)
+            home_visitor_score = fuzz.ratio(home_name, norm_visitor)
+            away_local_score = fuzz.ratio(away_name, norm_local)
+            
+            # Get best team name match configuration
+            direct_match = home_local_score + away_visitor_score
+            reverse_match = home_visitor_score + away_local_score
+            
+            # Use the better of the two matching patterns
+            match_score = max(direct_match, reverse_match)
+            
+            # Time matching bonus (if available)
+            time_bonus = 0
+            if match_time and "starting_at" in fixture:
+                fixture_time = fixture["starting_at"].split(" ")[1][:5] if " " in fixture["starting_at"] else ""
+                if fixture_time and match_time:
+                    # Convert match_time to the same format if needed
+                    parsed_match_time = match_time.replace(".", ":")[:5]
+                    if parsed_match_time == fixture_time:
+                        time_bonus = 20
+            
+            total_score = match_score + time_bonus
+            
+            # Update best match if this one is better
+            if total_score > best_score and total_score >= 160:  # Threshold for good match
+                best_score = total_score
+                best_match = fixture
+                
+        return best_match
+
+    def update_fixture_mapping(self, goalserve_id, sportmonks_id, confidence_score=100):
+        """Store mapping between GoalServe and Sportmonks fixture IDs"""
+        mapping = {
+            "goalserve_id": goalserve_id,
+            "sportmonks_id": sportmonks_id,
+            "confidence": confidence_score,
+            "last_updated": datetime.now()
+        }
+        
+        # Save to mapping collection
+        self.db.fixture_id_mapping.update_one(
+            {"goalserve_id": goalserve_id},
+            {"$set": mapping},
+            upsert=True
+        )
+        
+        logger.info(f"Created mapping: GoalServe ID {goalserve_id} → Sportmonks ID {sportmonks_id}")
+
     
     def collect_all_fdr_data(self, major_league_ids=None):
         """Collect all data needed for FDR calculation"""
@@ -685,5 +854,5 @@ if __name__ == "__main__":
     
     # MongoDB URI is directly configured in the class
     collector = FDRDataCollector(sportmonks_token, goalserve_token)
-    collector.collect_all_fdr_data()
-    # collector.get_goalserve_fixture_odds(match_id="6097594")
+    # collector.collect_all_fdr_data()
+    collector.get_goalserve_fixture_odds()

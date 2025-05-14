@@ -8,6 +8,7 @@ from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
 import numpy as np
 from pymongo.server_api import ServerApi
+import re
 from pymongo.errors import ServerSelectionTimeoutError
 # Configure logging
 logging.basicConfig(
@@ -472,14 +473,88 @@ class FDRCalculator:
         return 1 - normalized_probability
     
     def calculate_odds_component(self, fixture_id, home_team_id, away_team_id):
-        """Calculate fixture odds component (30% of FDR)"""
-        #Try both Sportmonks and GoalServe IDs
-        goalserve_odds = self.db.fixtureOdds.find_one({
-            "$or": [
-                {"sportmonks_id": fixture_id},
-                {"match_id": str(fixture_id)}
-            ]
-        })
+        """Calculate fixture odds component (30% of FDR) with improved ID mapping"""
+        
+        # First check for a mapping in our dedicated mapping collection
+        mapping = self.db.fixture_id_mapping.find_one({"sportmonks_id": fixture_id})
+        goalserve_id = mapping.get("goalserve_id") if mapping else None
+        
+        # Try multiple strategies to find odds
+        goalserve_odds = None
+        
+        # Strategy 1: Direct Sportmonks ID match
+        if not goalserve_odds:
+            goalserve_odds = self.db.fixtureOdds.find_one({"sportmonks_id": fixture_id})
+        
+        # Strategy 2: GoalServe ID from mapping
+        if not goalserve_odds and goalserve_id:
+            goalserve_odds = self.db.fixtureOdds.find_one({"match_id": goalserve_id})
+        
+        # Strategy 3: Team name + date matching as fallback
+        if not goalserve_odds:
+            # Get fixture details
+            fixture = self.db.fixtures.find_one({"id": fixture_id})
+            if fixture and "participants" in fixture and len(fixture["participants"]) >= 2:
+                home_team_name = fixture["participants"][0].get("name", "")
+                away_team_name = fixture["participants"][1].get("name", "")
+                match_date = fixture["starting_at"].split(" ")[0] if " " in fixture["starting_at"] else ""
+                
+                # Get teams with normalized names
+                home_normalized = self._normalize_team_name(home_team_name)
+                away_normalized = self._normalize_team_name(away_team_name)
+                
+                # Try to find by team names with fuzzy matching
+                potential_matches = list(self.db.fixtureOdds.find({
+                    "$or": [
+                        {"local_team.name": {"$regex": home_team_name.split(" ")[0], "$options": "i"}},
+                        {"visitor_team.name": {"$regex": away_team_name.split(" ")[0], "$options": "i"}}
+                    ]
+                }))
+                
+                best_match = None
+                best_score = 0
+                
+                for match in potential_matches:
+                    local_normalized = self._normalize_team_name(match.get("local_team", {}).get("name", ""))
+                    visitor_normalized = self._normalize_team_name(match.get("visitor_team", {}).get("name", ""))
+                    
+                    # Calculate match scores both ways (in case teams are reversed)
+                    direct_score = (
+                        self._fuzzy_match_score(home_normalized, local_normalized) +
+                        self._fuzzy_match_score(away_normalized, visitor_normalized)
+                    )
+                    
+                    reverse_score = (
+                        self._fuzzy_match_score(home_normalized, visitor_normalized) +
+                        self._fuzzy_match_score(away_normalized, local_normalized)
+                    )
+                    
+                    match_score = max(direct_score, reverse_score)
+                    
+                    # Date matching bonus
+                    match_date_str = match.get("match_date", "")
+                    if match_date and match_date_str:
+                        normalized_date = self._normalize_date(match_date_str)
+                        if normalized_date and normalized_date == match_date:
+                            match_score += 40
+                    
+                    if match_score > best_score and match_score >= 160:  # Threshold for good match
+                        best_score = match_score
+                        best_match = match
+                
+                if best_match:
+                    goalserve_odds = best_match
+                    
+                    # Update mapping for future use
+                    self.db.fixture_id_mapping.update_one(
+                        {"sportmonks_id": fixture_id},
+                        {"$set": {
+                            "goalserve_id": best_match["match_id"],
+                            "confidence": best_score,
+                            "last_updated": datetime.now()
+                        }},
+                        upsert=True
+                    )
         
         if goalserve_odds and goalserve_odds.get("odds"):
             for odds_type in goalserve_odds.get("odds", []):
@@ -515,78 +590,60 @@ class FDRCalculator:
                         away_diff = 1 - p_away - (0.5 * p_draw)
                         
                         return home_diff, away_diff
-        # If no goalserve odds, try sportmonks odds
-        sportmonks_odds = self.db.sportmonksPrematchOdds.find({
-            "fixture_id": fixture_id,
-            "market_id": 1  # Match Winner market
-        })
-        
-        sportmonks_odds = list(sportmonks_odds)
-        
-        if sportmonks_odds:
-            home_odds = []
-            draw_odds = []
-            away_odds = []
-            
-            for odd in sportmonks_odds:
-                if odd.get("label") == "1":  # Home win
-                    home_odds.append(float(odd.get("value")))
-                elif odd.get("label") == "X":  # Draw
-                    draw_odds.append(float(odd.get("value")))
-                elif odd.get("label") == "2":  # Away win
-                    away_odds.append(float(odd.get("value")))
-            
-            if home_odds and draw_odds and away_odds:
-                # Calculate average odds
-                avg_home_odd = sum(home_odds) / len(home_odds)
-                avg_draw_odd = sum(draw_odds) / len(draw_odds)
-                avg_away_odd = sum(away_odds) / len(away_odds)
-                
-                # Convert to probabilities
-                p_home = 1 / avg_home_odd
-                p_draw = 1 / avg_draw_odd
-                p_away = 1 / avg_away_odd
-                
-                # Normalize probabilities to sum to 1
-                total = p_home + p_draw + p_away
-                p_home /= total
-                p_draw /= total
-                p_away /= total
-                
-                # Calculate difficulty scores
-                home_difficulty = 1 - p_home - (0.5 * p_draw)
-                away_difficulty = 1 - p_away - (0.5 * p_draw)
-                
-                return home_difficulty, away_difficulty
-        
-        # If no odds data at all, use predictions if available
-        predictions = self.db.predictions.find_one({
-            "fixture_id": fixture_id,
-            "type_id": 237  # Match winner prediction type
-        })
-        
-        if predictions and "predictions" in predictions:
-            pred_data = predictions["predictions"]
-            p_home = pred_data.get("home", 0) / 100
-            p_draw = pred_data.get("draw", 0) / 100
-            p_away = pred_data.get("away", 0) / 100
-            
-            # Normalize probabilities
-            total = p_home + p_draw + p_away
-            if total > 0:
-                p_home /= total
-                p_draw /= total
-                p_away /= total
-                
-                # Calculate difficulty scores
-                home_difficulty = 1 - p_home - (0.5 * p_draw)
-                away_difficulty = 1 - p_away - (0.5 * p_draw)
-                
-                return home_difficulty, away_difficulty
         
         # Fallback: use historical data
         return self.calculate_historical_component(home_team_id, away_team_id)[0], \
                self.calculate_historical_component(home_team_id, away_team_id)[1]
+    
+    def _normalize_team_name(self, name):
+        """Helper method to normalize team names"""
+        if not name:
+            return ""
+        
+        name = name.lower()
+        
+        # Remove common suffixes
+        suffixes = [" fc", " cf", " united", " utd", " city", " athletic"]
+        for suffix in suffixes:
+            if name.endswith(suffix):
+                name = name[:-len(suffix)]
+        
+        # Remove special characters and extra spaces
+        name = re.sub(r'[^\w\s]', ' ', name)
+        name = re.sub(r'\s+', ' ', name).strip()
+        
+        return name
+
+    def _normalize_date(self, date_str):
+        """Helper method to normalize date formats"""
+        if not date_str:
+            return None
+            
+        # Handle "May 14" format
+        match = re.match(r"(\w+)\s+(\d+)", date_str)
+        if match:
+            month_name, day = match.groups()
+            current_year = datetime.now().year
+            try:
+                date_obj = datetime.strptime(f"{month_name} {day} {current_year}", "%b %d %Y")
+                # If date is in the past by more than a week, it might be next year
+                if (datetime.now() - date_obj).days > 7:
+                    date_obj = datetime.strptime(f"{month_name} {day} {current_year+1}", "%b %d %Y")
+                return date_obj.strftime("%Y-%m-%d")
+            except ValueError:
+                pass
+        
+        # Already in ISO format
+        if re.match(r"\d{4}-\d{2}-\d{2}", date_str):
+            return date_str
+            
+        return None
+
+    def _fuzzy_match_score(self, str1, str2):
+        """Calculate fuzzy matching score between two strings"""
+        if not str1 or not str2:
+            return 0
+        return fuzz.ratio(str1, str2)
     
     
     def calculate_availability_component(self, team_id):
@@ -866,4 +923,5 @@ if __name__ == "__main__":
     calculator = FDRCalculator()
     # calculator.test_epl_fixtures()
     # Calculate FDR for all upcoming fixtures
-    calculator.calculate_all_fixtures(days_ahead=14)
+    # calculator.calculate_all_fixtures(days_ahead=14)
+    calculator.test_epl_fixtures()                                                                                                                                                                              
