@@ -473,46 +473,48 @@ class FDRCalculator:
     
     def calculate_odds_component(self, fixture_id, home_team_id, away_team_id):
         """Calculate fixture odds component (30% of FDR)"""
-        # Try goalserve odds first
-        goalserve_odds = self.db.fixtureOdds.find_one({"match_id": str(fixture_id)})
+        #Try both Sportmonks and GoalServe IDs
+        goalserve_odds = self.db.fixtureOdds.find_one({
+            "$or": [
+                {"sportmonks_id": fixture_id},
+                {"match_id": str(fixture_id)}
+            ]
+        })
         
         if goalserve_odds and goalserve_odds.get("odds"):
             for odds_type in goalserve_odds.get("odds", []):
                 if odds_type.get("type_value") == "Match Winner" and odds_type.get("bookmakers"):
-                    # Get average odds across bookmakers
+                    # Calculate average odds across all bookmakers
                     home_odds = []
                     draw_odds = []
                     away_odds = []
                     
                     for bookmaker in odds_type.get("bookmakers", []):
-                        if "home_odd" in bookmaker and "draw_odd" in bookmaker and "away_odd" in bookmaker:
-                            home_odds.append(bookmaker["home_odd"])
-                            draw_odds.append(bookmaker["draw_odd"])
-                            away_odds.append(bookmaker["away_odd"])
+                        home_odds.append(bookmaker.get("home_odd"))
+                        draw_odds.append(bookmaker.get("draw_odd"))
+                        away_odds.append(bookmaker.get("away_odd"))
                     
                     if home_odds and draw_odds and away_odds:
-                        # Calculate average odds
-                        avg_home_odd = sum(home_odds) / len(home_odds)
-                        avg_draw_odd = sum(draw_odds) / len(draw_odds)
-                        avg_away_odd = sum(away_odds) / len(away_odds)
+                        avg_home = sum(home_odds) / len(home_odds)
+                        avg_draw = sum(draw_odds) / len(draw_odds)
+                        avg_away = sum(away_odds) / len(away_odds)
                         
                         # Convert to probabilities
-                        p_home = 1 / avg_home_odd
-                        p_draw = 1 / avg_draw_odd
-                        p_away = 1 / avg_away_odd
+                        p_home = 1 / avg_home
+                        p_draw = 1 / avg_draw
+                        p_away = 1 / avg_away
                         
-                        # Normalize probabilities to sum to 1
+                        # Normalize probabilities
                         total = p_home + p_draw + p_away
                         p_home /= total
                         p_draw /= total
                         p_away /= total
                         
                         # Calculate difficulty scores
-                        home_difficulty = 1 - p_home - (0.5 * p_draw)
-                        away_difficulty = 1 - p_away - (0.5 * p_draw)
+                        home_diff = 1 - p_home - (0.5 * p_draw)
+                        away_diff = 1 - p_away - (0.5 * p_draw)
                         
-                        return home_difficulty, away_difficulty
-        
+                        return home_diff, away_diff
         # If no goalserve odds, try sportmonks odds
         sportmonks_odds = self.db.sportmonksPrematchOdds.find({
             "fixture_id": fixture_id,
@@ -585,6 +587,7 @@ class FDRCalculator:
         # Fallback: use historical data
         return self.calculate_historical_component(home_team_id, away_team_id)[0], \
                self.calculate_historical_component(home_team_id, away_team_id)[1]
+    
     
     def calculate_availability_component(self, team_id):
         """Calculate player availability component (10% or 20% of FDR)"""
@@ -704,7 +707,156 @@ class FDRCalculator:
                 continue
         
         return summaries
+    
+    def test_epl_fixtures(self):
+        """Test FDR components for all English Premier League fixtures"""
+        print("\n=== TESTING FDR COMPONENTS FOR ALL PREMIER LEAGUE FIXTURES ===\n")
+        
+        # Find all upcoming Premier League fixtures
+        fixtures = list(self.db.fixtures.find({
+            "league.short_code": "UK PL",
+            "starting_at": {"$gte": datetime.now().strftime("%Y-%m-%d")}
+        }))
+        
+        if not fixtures:
+            print("No Premier League fixtures found. Trying alternative lookup method...")
+            # Try getting league ID first
+            premier_league = self.db.leagues.find_one({"short_code": "UK PL"})
+            if premier_league:
+                league_id = premier_league["id"]
+                fixtures = list(self.db.fixtures.find({
+                    "$or": [
+                        {"league.id": league_id},
+                        {"league_id": league_id}
+                    ],
+                    "starting_at": {"$gte": datetime.now().strftime("%Y-%m-%d")}
+                }))
+        
+        if not fixtures:
+            print("No Premier League fixtures found in the database.")
+            return
+        
+        print(f"Found {len(fixtures)} Premier League fixtures\n")
+        
+        # Component weight combinations to test
+        weight_scenarios = [
+            {"name": "Odds Heavy", "historical": 0.10, "form": 0.10, "outright": 0.10, "odds": 0.60, "availability": 0.10},
+            {"name": "Historical Heavy", "historical": 0.40, "form": 0.20, "outright": 0.10, "odds": 0.25, "availability": 0.05},
+            {"name": "Balanced", "historical": 0.25, "form": 0.15, "outright": 0.15, "odds": 0.35, "availability": 0.10},
+            {"name": "Current", "historical": 0.20, "form": 0.20, "outright": 0.15, "odds": 0.40, "availability": 0.05}
+        ]
+        
+        # Process each fixture
+        for fixture in fixtures:
+            self._test_individual_fixture(fixture, weight_scenarios)
+        
+        print("\n=== COMPLETED TESTING ALL PREMIER LEAGUE FIXTURES ===")
 
+    def _test_individual_fixture(self, fixture, weight_scenarios):
+        """Test different weight combinations for a single fixture"""
+        # Extract team data
+        home_team_id = None
+        away_team_id = None
+        home_team_name = "Home Team"
+        away_team_name = "Away Team"
+        
+        if "participants" in fixture and len(fixture["participants"]) >= 2:
+            home_team_id = fixture["participants"][0].get("id")
+            away_team_id = fixture["participants"][1].get("id")
+            home_team_name = fixture["participants"][0].get("name", "Home Team")
+            away_team_name = fixture["participants"][1].get("name", "Away Team")
+        
+        # Get league information
+        league_id = fixture.get("league_id")
+        if not league_id and "league" in fixture:
+            league_id = fixture["league"].get("id")
+        
+        league = self.db.leagues.find_one({"id": league_id})
+        is_major = league.get("is_major", True)  # Premier League is major by default
+        is_derby = self.check_if_derby(home_team_id, away_team_id)
+        
+        # Calculate each component
+        historical = self.calculate_historical_component(home_team_id, away_team_id, is_derby)
+        home_form = self.calculate_form_component(home_team_id)
+        away_form = self.calculate_form_component(away_team_id)
+        home_outright = self.calculate_outright_component(home_team_id)
+        away_outright = self.calculate_outright_component(away_team_id)
+        odds = self.calculate_odds_component(fixture.get("id"), home_team_id, away_team_id)
+        home_availability = self.calculate_availability_component(home_team_id)
+        away_availability = self.calculate_availability_component(away_team_id)
+        
+        # Store components
+        home_components = {
+            "historical": historical[0],
+            "form": home_form,
+            "outright": home_outright,
+            "odds": odds[0],
+            "availability": home_availability
+        }
+        
+        away_components = {
+            "historical": historical[1],
+            "form": away_form,
+            "outright": away_outright,
+            "odds": odds[1],
+            "availability": away_availability
+        }
+        
+        # Print fixture information
+        print(f"\n=== TESTING FDR COMPONENTS: {home_team_name} vs {away_team_name} ===")
+        print(f"League: {league.get('name') if league else 'Premier League'} (Derby: {is_derby})")
+        
+        # Print raw component values
+        print("\n=== RAW COMPONENT VALUES ===")
+        print(f"{'Component':<15} {'Home':<10} {'Away':<10}")
+        print("-" * 35)
+        for comp in home_components:
+            print(f"{comp.capitalize():<15} {home_components[comp]:<10.3f} {away_components[comp]:<10.3f}")
+        
+        # Test each component with 100% weight
+        print("\n=== FDR WITH 100% WEIGHT ON SINGLE COMPONENT ===")
+        print(f"{'Component':<15} {'Home FDR':<10} {'Away FDR':<10} {'Home Cat':<12} {'Away Cat':<12}")
+        print("-" * 60)
+        
+        for comp in home_components:
+            # Calculate with 100% weight on this component
+            home_fdr_raw = home_components[comp]
+            away_fdr_raw = away_components[comp]
+            
+            # Scale to 0-10
+            home_fdr = self.scale_to_range(home_fdr_raw)
+            away_fdr = self.scale_to_range(away_fdr_raw)
+            
+            # Get categories
+            home_category = self.get_fdr_category(home_fdr)
+            away_category = self.get_fdr_category(away_fdr)
+            
+            print(f"{comp.capitalize():<15} {home_fdr:<10.2f} {away_fdr:<10.2f} {home_category:<12} {away_category:<12}")
+        
+        # Test different weight scenarios
+        print("\n=== WEIGHT SCENARIO COMPARISON ===")
+        print(f"{'Scenario':<15} {'Home FDR':<10} {'Away FDR':<10} {'Home Cat':<12} {'Away Cat':<12}")
+        print("-" * 60)
+        
+        for scenario in weight_scenarios:
+            weights = scenario.copy()
+            scenario_name = weights.pop("name")
+            
+            # Calculate weighted FDR
+            home_fdr_raw = sum(home_components[comp] * weights[comp] for comp in home_components)
+            away_fdr_raw = sum(away_components[comp] * weights[comp] for comp in away_components)
+            
+            # Scale to 0-10
+            home_fdr = self.scale_to_range(home_fdr_raw)
+            away_fdr = self.scale_to_range(away_fdr_raw)
+            
+            # Get categories
+            home_category = self.get_fdr_category(home_fdr)
+            away_category = self.get_fdr_category(away_fdr)
+            
+            print(f"{scenario_name:<15} {home_fdr:<10.2f} {away_fdr:<10.2f} {home_category:<12} {away_category:<12}")
+        
+        print("-" * 80)
 
 
 
@@ -712,7 +864,6 @@ class FDRCalculator:
 if __name__ == "__main__":
     # Create an instance of the FDR calculator
     calculator = FDRCalculator()
-    
+    # calculator.test_epl_fixtures()
     # Calculate FDR for all upcoming fixtures
     calculator.calculate_all_fixtures(days_ahead=14)
-    calculator.generate_match_summaries(days_ahead=14)
