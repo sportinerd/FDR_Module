@@ -353,6 +353,12 @@ class FDRCalculator:
         
         # If there are no historical matches, return moderate difficulty
         if weighted_matches == 0:
+            # Convert team IDs to integers if they're strings
+            if isinstance(home_team_id, str):
+                home_team_id = int(home_team_id)
+            if isinstance(away_team_id, str):
+                away_team_id = int(away_team_id)
+                
             # Generate slightly different values based on team IDs for variety
             home_value = 0.45 + (home_team_id % 10) / 100
             away_value = 0.45 + (away_team_id % 10) / 100
@@ -428,7 +434,7 @@ class FDRCalculator:
             return 1 - form_ratio
         
         # Fallback
-        return 0.5
+        print("Not able to counter form")
     
     def calculate_outright_component(self, team_id):
         """Calculate season outright component (20% of FDR for major leagues)"""
@@ -717,6 +723,719 @@ class FDRCalculator:
             return "TOUGH"
         else:
             return "TOUGHEST"
+        
+    def calculate_xg_from_scoreline(self, fixture_id):
+        """Calculate expected goals from scoreline probabilities"""
+        if isinstance(fixture_id, int) or fixture_id.isdigit():
+            # This might be a SportMonks ID, check for mapping
+            mapping = self.db.fixture_id_mapping.find_one({"sportmonks_id": int(fixture_id)})
+            if mapping:
+                # Get the corresponding Goalserve ID
+                goalserve_id = mapping["goalserve_id"]
+            else:
+                goalserve_id = fixture_id
+        else:
+            goalserve_id = fixture_id
+            
+        # Rest of your existing function using goalserve_id
+        probabilities = list(self.db.scorelineProbabilities.find({
+            "fixture_id": goalserve_id,
+            "source": "goalserve"
+        }))
+        # probabilities = list(self.db.scorelineProbabilities.find({"fixture_id": fixture_id}))
+    
+        if not probabilities:
+            # Check if we have direct xG data in the database instead
+            xg_data = self.db.fixtureExpectedGoals.find_one({"fixture_id": fixture_id})
+            if xg_data:
+                return xg_data.get("home_xg"), xg_data.get("away_xg")
+            logger.warning(f"No xG data available for fixture {fixture_id}")
+            return None, None
+        
+        home_xg = 0
+        away_xg = 0
+        
+        # Calculate xG by summing (goals × probability)
+        for prob in probabilities:
+            home_goals = prob.get("home_goals", 0)
+            away_goals = prob.get("away_goals", 0)
+            # Fix: Convert percentage to decimal probability properly (7.169% -> 0.07169)
+            probability = prob.get("probability", 0) / 100
+            
+            home_xg += home_goals * probability
+            away_xg += away_goals * probability
+        
+        return home_xg, away_xg
+    
+    def get_league_average_xg(self, league_id):
+        """Get league average xG for home and away teams"""
+        league_avg = self.db.leagueAverages.find_one({"league_id": league_id})
+        
+        if league_avg:
+            return league_avg.get("home_xg_avg", 1.4), league_avg.get("away_xg_avg", 1.1)
+        
+        # Default values based on typical averages in top leagues
+        return 1.4, 1.1
+    
+    def calculate_league_averages(self):
+        """Calculate league average xG values from historical matches"""
+        leagues = self.db.leagues.find({})
+        
+        for league in leagues:
+            league_id = league["id"]
+            
+            # Get historical matches for this league
+            matches = self.db.historicalMatches.find({"league_id": league_id})
+            
+            home_xg_values = []
+            away_xg_values = []
+            
+            for match in matches:
+                # Extract xG values if available
+                if "stats" in match and "xg" in match["stats"]:
+                    home_xg = match["stats"]["xg"].get("home")
+                    away_xg = match["stats"]["xg"].get("away")
+                    
+                    if home_xg is not None and away_xg is not None:
+                        home_xg_values.append(home_xg)
+                        away_xg_values.append(away_xg)
+            
+            # Calculate averages
+            if home_xg_values and away_xg_values:
+                home_avg = sum(home_xg_values) / len(home_xg_values)
+                away_avg = sum(away_xg_values) / len(away_xg_values)
+                
+                # Save to MongoDB
+                self.db.leagueAverages.update_one(
+                    {"league_id": league_id},
+                    {"$set": {
+                        "home_xg_avg": home_avg,
+                        "away_xg_avg": away_avg,
+                        "last_updated": datetime.now()
+                    }},
+                    upsert=True
+                )
+                logger.info(f"Updated xG averages for league {league['name']}: Home {home_avg:.2f}, Away {away_avg:.2f}")
+            else:
+                # Use default values if no historical xG data
+                self.db.leagueAverages.update_one(
+                    {"league_id": league_id},
+                    {"$set": {
+                        "home_xg_avg": 1.4,
+                        "away_xg_avg": 1.1,
+                        "last_updated": datetime.now(),
+                        "is_default": True
+                    }},
+                    upsert=True
+                )
+                logger.info(f"Set default xG averages for league {league['name']} (no historical data)")
+
+    def convert_strength_to_fdr(self, strength):
+        """Convert strength coefficient to FDR scale (0-10)"""
+        # Strength of 1.0 is average (FDR 5)
+        # Higher strength = easier fixture = lower FDR
+        if strength >= 1.0:
+            fdr = 5 - (strength - 1.0) * 5  # Easier (below 5)
+        else:
+            fdr = 5 + (1.0 - strength) * 5  # Harder (above 5)
+        
+        return max(0, min(10, fdr))  # Ensure within 0-10 range
+
+    def calculate_fixture_fdr_new(self, fixture, use_odds_heavy=True):
+        """Calculate FDR using the odds-heavy xG approach"""
+        fixture_id = fixture.get("id")
+        league_id = fixture.get("league_id") or fixture.get("league", {}).get("id")
+        
+        logger.info(f"Calculating {'odds-heavy' if use_odds_heavy else 'pure xG'} FDR for fixture {fixture_id}")
+        
+        # Extract team information
+        home_team_id = None
+        away_team_id = None
+        
+        if "participants" in fixture and len(fixture["participants"]) >= 2:
+            home_team_id = fixture["participants"][0].get("id")
+            away_team_id = fixture["participants"][1].get("id")
+        else:
+            home_team_id = fixture.get("local_team", {}).get("id")
+            away_team_id = fixture.get("visitor_team", {}).get("id")
+        
+        if not home_team_id or not away_team_id:
+            logger.warning(f"Missing team IDs for fixture {fixture_id}")
+            return False
+        
+        # Calculate xG from scoreline probabilities
+        home_xg, away_xg = self.calculate_xg_from_scoreline(fixture_id)
+        
+        # Fallback if no data available
+        if home_xg is None:
+            # Try historical component as fallback
+            historical = self.calculate_historical_component(home_team_id, away_team_id)
+            home_xg = 1.4 * (1 - historical[0])  # Convert difficulty to expected goals
+            away_xg = 1.1 * (1 - historical[1])
+            logger.warning(f"Using historical fallback for fixture {fixture_id}: {home_xg:.2f}, {away_xg:.2f}")
+        
+        # Get league average xG
+        home_league_avg, away_league_avg = self.get_league_average_xg(league_id)
+        
+        # Store original xG for reference
+        original_home_xg = home_xg
+        original_away_xg = away_xg
+        
+        # Apply odds-heavy approach if requested
+        if use_odds_heavy:
+            home_odds, away_odds = self.calculate_odds_component(fixture_id, home_team_id, away_team_id)
+            
+            # Convert odds difficulty to strength factor
+            odds_factor_home = 2 - (1.5 * home_odds)
+            odds_factor_away = 2 - (1.5 * away_odds)
+            
+            # Apply 60% odds weight, 40% pure xG weight
+            home_xg = (0.4 * home_xg) + (0.6 * odds_factor_home * home_league_avg)
+            away_xg = (0.4 * away_xg) + (0.6 * odds_factor_away * away_league_avg)
+        
+        # Calculate team strength metrics
+        home_attack = home_xg / home_league_avg
+        away_attack = away_xg / away_league_avg
+        home_defense = away_xg / away_league_avg
+        away_defense = home_xg / home_league_avg
+        
+        # Calculate fixture strength
+        home_fixture_strength = home_attack * away_defense
+        away_fixture_strength = away_attack * home_defense
+        
+        # Convert to FDR scale (0-10)
+        home_fdr = self.convert_strength_to_fdr(home_fixture_strength)
+        away_fdr = self.convert_strength_to_fdr(away_fixture_strength)
+        
+        # Get categories
+        home_category = self.get_fdr_category(home_fdr)
+        away_category = self.get_fdr_category(away_fdr)
+        
+        # Create and save FDR data
+        fdr_data = {
+            "overall": {
+                "home": {
+                    "raw_score": home_fixture_strength,
+                    "fdr": home_fdr,
+                    "category": home_category,
+                    "color": self.color_map[home_category],
+                    "xg": home_xg
+                },
+                "away": {
+                    "raw_score": away_fixture_strength,
+                    "fdr": away_fdr,
+                    "category": away_category,
+                    "color": self.color_map[away_category],
+                    "xg": away_xg
+                }
+            },
+            "components": {
+                "home": {
+                    "attack_strength": home_attack,
+                    "defense_weakness": home_defense
+                },
+                "away": {
+                    "attack_strength": away_attack,
+                    "defense_weakness": away_defense
+                }
+            },
+            "calculation_method": "xg_based",
+            "calculated_at": datetime.now()
+        }
+        print(f"FDR data: {fdr_data}")
+        self.db.fixtures.update_one(
+            {"id": fixture_id},
+            {"$set": {"fdr": fdr_data}}
+        )
+        
+        logger.info(f"Completed xG-based FDR calculation for fixture {fixture_id}")
+        return True
+    
+    
+    def test_new_fdr_calculation(self):
+        """Test the new xG-based FDR calculation with fixtures having scoreline data"""
+        # Find fixtures with scoreline probability data
+        scoreline_fixtures = list(self.db.scorelineProbabilities.distinct("fixture_id"))
+        
+        if not scoreline_fixtures:
+            logger.error("No fixtures with scoreline probabilities found")
+            return
+        
+        logger.info(f"Found {len(scoreline_fixtures)} fixtures with scoreline probabilities")
+        
+        test_count = min(len(scoreline_fixtures), 5)  # Test up to 5 fixtures
+        
+        for i, fixture_id in enumerate(scoreline_fixtures[:test_count]):
+            fixture = self.db.fixtures.find_one({"id": fixture_id})
+            
+            if not fixture:
+                logger.warning(f"Fixture {fixture_id} not found in fixtures collection")
+                continue
+            
+            # Get team names for logging
+            home_name = "Unknown"
+            away_name = "Unknown"
+            
+            if "participants" in fixture and len(fixture["participants"]) >= 2:
+                home_name = fixture["participants"][0].get("name", "Home")
+                away_name = fixture["participants"][1].get("name", "Away")
+            
+            logger.info(f"Testing fixture {i+1}/{test_count}: {home_name} vs {away_name}")
+            
+            # Calculate xG
+            home_xg, away_xg = self.calculate_xg_from_scoreline(fixture_id)
+            logger.info(f"Calculated xG - Home: {home_xg:.2f}, Away: {away_xg:.2f}")
+            
+            # Calculate FDR
+            result = self.calculate_fixture_fdr_new(fixture)
+            
+            # Retrieve and display the FDR data
+            updated_fixture = self.db.fixtures.find_one({"id": fixture_id})
+            if "fdr" in updated_fixture:
+                fdr_data = updated_fixture["fdr"]
+                logger.info(f"Home FDR: {fdr_data['overall']['home']['fdr']:.2f}, " +
+                            f"Away FDR: {fdr_data['overall']['away']['fdr']:.2f}")
+                
+                # Show attack and defense values
+                logger.info(f"Home Attack: {fdr_data['components']['home']['attack_strength']:.2f}, " +
+                            f"Home Defense: {fdr_data['components']['home']['defense_weakness']:.2f}")
+                logger.info(f"Away Attack: {fdr_data['components']['away']['attack_strength']:.2f}, " +
+                            f"Away Defense: {fdr_data['components']['away']['defense_weakness']:.2f}")
+            
+            logger.info("-" * 50)
+
+
+    # def test_xg_calculation(self):
+    #     """Test xG calculation from scoreline probabilities"""
+    #     scoreline_fixtures = self.db.scorelineProbabilities.distinct("fixture_id")
+        
+    #     if not scoreline_fixtures:
+    #         logger.error("No fixtures with scoreline probabilities found")
+    #         return
+        
+    #     logger.info(f"Found {len(scoreline_fixtures)} fixtures with scoreline probabilities")
+        
+    #     for fixture_id in scoreline_fixtures:
+    #         # First check in fixture_id_mapping collection
+    #         mapping = self.db.fixture_id_mapping.find_one({"sportmonks_id": fixture_id})
+            
+    #         if mapping:
+    #             fixture = self.db.fixtures.find_one({"id": fixture_id})
+    #         # else:
+    #         #     # Try direct lookup with multiple approaches
+    #         #     fixture = self.db.fixtures.find_one({"id": fixture_id})
+                
+    #         #     # Try other options if not found
+    #         #     if not fixture:
+    #         #         fixture = self.db.fixtures.find_one({"sportmonks_id": fixture_id})
+                
+    #         #     if not fixture:
+    #         #         # Try string/int conversion
+    #         #         try:
+    #         #             if isinstance(fixture_id, str):
+    #         #                 fixture = self.db.fixtures.find_one({"id": int(fixture_id)})
+    #         #             else:
+    #         #                 fixture = self.db.fixtures.find_one({"id": str(fixture_id)})
+    #         #         except (ValueError, TypeError):
+    #         #             pass
+            
+    #         if not fixture:
+    #             logger.warning(f"Could not find fixture for ID {fixture_id}")
+    #             continue
+                
+    #         # Get team names for logging
+    #         home_name = "Unknown"
+    #         away_name = "Unknown"
+    #         if "participants" in fixture and len(fixture["participants"]) >= 2:
+    #             home_name = fixture["participants"][0].get("name", "Home")
+    #             away_name = fixture["participants"][1].get("name", "Away")
+            
+    #         # Calculate xG
+    #         home_xg, away_xg = self.calculate_xg_from_scoreline(fixture_id)
+    #         if home_xg is None:
+    #             logger.warning(f"Could not calculate xG for {home_name} vs {away_name}")
+    #             continue
+                    
+    #         logger.info(f"Fixture: {home_name} vs {away_name}")
+    #         logger.info(f"xG values - Home: {home_xg:.2f}, Away: {away_xg:.2f}")
+            
+    #         # Calculate league averages
+    #         league_id = fixture.get("league", {}).get("id")
+    #         home_league_avg, away_league_avg = self.get_league_average_xg(league_id)
+    #         logger.info(f"League averages - Home: {home_league_avg:.2f}, Away: {away_league_avg:.2f}")
+            
+    #         # Calculate strength coefficients
+    #         home_attack = home_xg / home_league_avg
+    #         away_attack = away_xg / away_league_avg
+    #         home_defense = away_xg / away_league_avg
+    #         away_defense = home_xg / home_league_avg
+            
+    #         logger.info(f"Home attack: {home_attack:.2f}, Home defense: {home_defense:.2f}")
+    #         logger.info(f"Away attack: {away_attack:.2f}, Away defense: {away_defense:.2f}")
+            
+    #         # Calculate fixture strength
+    #         home_strength = home_attack * away_defense
+    #         away_strength = away_attack * home_defense
+            
+    #         logger.info(f"Fixture strength - Home: {home_strength:.2f}, Away: {away_strength:.2f}")
+            
+    #         # Calculate FDR
+    #         home_fdr = self.convert_strength_to_fdr(home_strength)
+    #         away_fdr = self.convert_strength_to_fdr(away_strength)
+            
+    #         logger.info(f"FDR values - Home: {home_fdr:.2f}, Away: {away_fdr:.2f}")
+    #         logger.info("-" * 50)
+
+    def test_odds_heavy_calculation(self):
+        """Test the odds-heavy xG calculation method"""
+        scoreline_fixtures = self.db.scorelineProbabilities.distinct("fixture_id")
+        
+        if not scoreline_fixtures:
+            logger.error("No fixtures with scoreline probabilities found")
+            return
+        
+        logger.info(f"Found {len(scoreline_fixtures)} fixtures with scoreline probabilities")
+        
+        for fixture_id in scoreline_fixtures:
+            # Find fixture with proper handling for Goalserve structure
+            fixture = self.db.fixtures.find_one({"id": fixture_id})
+            
+            if not fixture:
+                logger.warning(f"Could not find fixture for ID {fixture_id}")
+                continue
+                
+            # Extract team names with support for both data structures
+            home_name = "Unknown"
+            away_name = "Unknown"
+            
+            if "participants" in fixture and len(fixture["participants"]) >= 2:
+                home_name = fixture["participants"][0].get("name", "Home")
+                away_name = fixture["participants"][1].get("name", "Away")
+            elif "local_team" in fixture and "visitor_team" in fixture:
+                home_name = fixture["local_team"].get("name", "Home")
+                away_name = fixture["visitor_team"].get("name", "Away")
+            
+            # Extract team IDs with support for both data structures
+            home_team_id = None
+            away_team_id = None
+            
+            if "participants" in fixture and len(fixture["participants"]) >= 2:
+                home_team_id = fixture["participants"][0].get("id")
+                away_team_id = fixture["participants"][1].get("id")
+            elif "local_team" in fixture and "visitor_team" in fixture:
+                home_team_id = fixture["local_team"].get("id")
+                away_team_id = fixture["visitor_team"].get("id")
+            
+            if not home_team_id or not away_team_id:
+                logger.warning(f"Missing team IDs for fixture {fixture_id}")
+                continue
+            
+            # Get league ID with support for category_id as fallback
+            league_id = fixture.get("league_id") or fixture.get("league", {}).get("id") or fixture.get("category_id")
+            
+            if not league_id:
+                logger.warning(f"No league ID found for fixture {fixture_id}")
+                continue
+            
+            # Calculate standard xG
+            home_xg, away_xg = self.calculate_xg_from_scoreline(fixture_id)
+            if home_xg is None:
+                logger.warning(f"Could not calculate xG for {home_name} vs {away_name}")
+                continue
+                    
+            logger.info(f"Fixture: {home_name} vs {away_name}")
+            logger.info(f"Pure xG values - Home: {home_xg:.2f}, Away: {away_xg:.2f}")
+            
+            # Calculate league averages
+            home_league_avg, away_league_avg = self.get_league_average_xg(league_id)
+            logger.info(f"League averages - Home: {home_league_avg:.2f}, Away: {away_league_avg:.2f}")
+            
+            # Get odds component
+            home_odds, away_odds = self.calculate_odds_component(fixture_id, home_team_id, away_team_id)
+            logger.info(f"Odds component - Home: {home_odds:.2f}, Away: {away_odds:.2f}")
+            
+            # Create odds-adjusted xG values (60% odds influence)
+            odds_factor_home = 2 - (1.5 * home_odds)  # Convert odds difficulty to strength factor
+            odds_factor_away = 2 - (1.5 * away_odds)
+            
+            logger.info(f"Odds factors - Home: {odds_factor_home:.2f}, Away: {odds_factor_away:.2f}")
+            
+            # Apply 60% odds weight, 40% pure xG weight
+            home_xg_adjusted = (0.5 * home_xg) + (0.5 * odds_factor_home * home_league_avg)
+            away_xg_adjusted = (0.5 * away_xg) + (0.5 * odds_factor_away * away_league_avg)
+            
+            logger.info(f"Adjusted xG values - Home: {home_xg_adjusted:.2f}, Away: {away_xg_adjusted:.2f}")
+            
+            # Calculate strength coefficients using adjusted xG
+            home_attack = home_xg_adjusted / home_league_avg
+            away_attack = away_xg_adjusted / away_league_avg
+            home_defense = away_xg_adjusted / away_league_avg
+            away_defense = home_xg_adjusted / home_league_avg
+            
+            logger.info(f"Adjusted strengths - Home attack: {home_attack:.2f}, Home defense: {home_defense:.2f}")
+            logger.info(f"Adjusted strengths - Away attack: {away_attack:.2f}, Away defense: {away_defense:.2f}")
+            
+            # Calculate fixture strength
+            home_strength = home_attack * away_defense
+            away_strength = away_attack * home_defense
+            
+            logger.info(f"Fixture strength - Home: {home_strength:.2f}, Away: {away_strength:.2f}")
+            
+            # Calculate FDR
+            home_fdr = self.convert_strength_to_fdr(home_strength)
+            away_fdr = self.convert_strength_to_fdr(away_strength)
+            
+            logger.info(f"Odds-heavy FDR - Home: {home_fdr:.2f}, Away: {away_fdr:.2f}")
+            logger.info("-" * 50)
+    
+    def test_comprehensive_fdr_calculation(self):
+        """Test the comprehensive multi-factor FDR calculation method"""
+        scoreline_fixtures = self.db.scorelineProbabilities.distinct("fixture_id")
+        
+        if not scoreline_fixtures:
+            logger.error("No fixtures with scoreline probabilities found")
+            return
+        
+        logger.info(f"Found {len(scoreline_fixtures)} fixtures with scoreline probabilities")
+        
+        for fixture_id in scoreline_fixtures:
+            # Find fixture with proper handling for Goalserve structure
+            fixture = self.db.fixtures.find_one({"id": fixture_id})
+            
+            if not fixture:
+                logger.warning(f"Could not find fixture for ID {fixture_id}")
+                continue
+                
+            # Extract team names with support for both data structures
+            home_name = "Unknown"
+            away_name = "Unknown"
+            
+            if "participants" in fixture and len(fixture["participants"]) >= 2:
+                home_name = fixture["participants"][0].get("name", "Home")
+                away_name = fixture["participants"][1].get("name", "Away")
+            elif "local_team" in fixture and "visitor_team" in fixture:
+                home_name = fixture["local_team"].get("name", "Home")
+                away_name = fixture["visitor_team"].get("name", "Away")
+            
+            # Extract team IDs with support for both data structures
+            home_team_id = None
+            away_team_id = None
+            
+            if "participants" in fixture and len(fixture["participants"]) >= 2:
+                home_team_id = fixture["participants"][0].get("id")
+                away_team_id = fixture["participants"][1].get("id")
+            elif "local_team" in fixture and "visitor_team" in fixture:
+                home_team_id = fixture["local_team"].get("id")
+                away_team_id = fixture["visitor_team"].get("id")
+            
+            if not home_team_id or not away_team_id:
+                logger.warning(f"Missing team IDs for fixture {fixture_id}")
+                continue
+            
+            # Get league ID with support for category_id as fallback
+            league_id = fixture.get("league_id") or fixture.get("league", {}).get("id") or fixture.get("category_id")
+            
+            if not league_id:
+                logger.warning(f"No league ID found for fixture {fixture_id}")
+                continue
+            
+            # Calculate standard xG
+            home_xg, away_xg = self.calculate_xg_from_scoreline(fixture_id)
+            if home_xg is None:
+                logger.warning(f"Could not calculate xG for {home_name} vs {away_name}")
+                continue
+            
+            logger.info(f"Fixture: {home_name} vs {away_name}")
+            logger.info(f"Pure xG values - Home: {home_xg:.2f}, Away: {away_xg:.2f}")
+            
+            # Calculate league averages
+            home_league_avg, away_league_avg = self.get_league_average_xg(league_id)
+            logger.info(f"League averages - Home: {home_league_avg:.2f}, Away: {away_league_avg:.2f}")
+            
+            # Get odds component
+            home_odds, away_odds = self.calculate_odds_component(fixture_id, home_team_id, away_team_id)
+            logger.info(f"Odds component - Home: {home_odds:.2f}, Away: {away_odds:.2f}")
+            
+            # Get additional components
+            historical = self.calculate_historical_component(home_team_id, away_team_id)
+            home_outright = self.calculate_outright_component(home_team_id)
+            away_outright = self.calculate_outright_component(away_team_id)
+            home_availability = self.calculate_availability_component(home_team_id)
+            away_availability = self.calculate_availability_component(away_team_id)
+            
+            logger.info(f"Historical - Home: {historical[0]:.2f}, Away: {historical[1]:.2f}")
+            logger.info(f"Outright - Home: {home_outright:.2f}, Away: {away_outright:.2f}")
+            logger.info(f"Availability - Home: {home_availability:.2f}, Away: {away_availability:.2f}")
+            
+            # Convert odds difficulty to strength factor
+            odds_factor_home = 2 - (1.5 * home_odds)
+            odds_factor_away = 2 - (1.5 * away_odds)
+            
+            logger.info(f"Odds factors - Home: {odds_factor_home:.2f}, Away: {odds_factor_away:.2f}")
+            
+            # Apply comprehensive weighting with odds emphasis (40-40-10-5-5 distribution)
+            home_xg_adjusted = (
+                0.20 * home_xg +                                   # Raw xG: 20%
+                0.60 * (odds_factor_home * home_league_avg) +      # Fixture Odds: 60% 
+                0.10 * (1.0 - historical[0]) * home_league_avg +   # Historical: 10%
+                0.05 * (1.0 - home_outright) * home_league_avg +   # Outright: 5%
+                0.05 * (1.0 - home_availability) * home_league_avg # Availability: 5%
+            )
+
+            
+            away_xg_adjusted = (
+                0.20 * away_xg +                                   # Raw xG: 40%
+                0.60 * (odds_factor_away * away_league_avg) +      # Fixture Odds: 40%
+                0.10 * (1.0 - historical[1]) * away_league_avg +   # Historical: 10%
+                0.05 * (1.0 - away_outright) * away_league_avg +    # Outright: 5%
+                0.05 * (1.0 - away_availability) * away_league_avg  # Availability: 5%
+            )
+            
+            logger.info(f"Adjusted xG values - Home: {home_xg_adjusted:.2f}, Away: {away_xg_adjusted:.2f}")
+            
+            # Calculate strength coefficients using adjusted xG
+            home_attack = home_xg_adjusted / home_league_avg
+            away_attack = away_xg_adjusted / away_league_avg
+            home_defense = away_xg_adjusted / away_league_avg
+            away_defense = home_xg_adjusted / home_league_avg
+            
+            logger.info(f"Adjusted strengths - Home attack: {home_attack:.2f}, Home defense: {home_defense:.2f}")
+            logger.info(f"Adjusted strengths - Away attack: {away_attack:.2f}, Away defense: {away_defense:.2f}")
+            
+            # Calculate fixture strength
+            home_strength = home_attack * away_defense
+            away_strength = away_attack * home_defense
+            
+            logger.info(f"Fixture strength - Home: {home_strength:.2f}, Away: {away_strength:.2f}")
+            
+            # Calculate FDR
+            home_fdr = self.convert_strength_to_fdr(home_strength)
+            away_fdr = self.convert_strength_to_fdr(away_strength)
+            
+            logger.info(f"Multi-factor FDR - Home: {home_fdr:.2f}, Away: {away_fdr:.2f}")
+            logger.info("-" * 50)
+
+
+
+    def test_comprehensive_fdr_calculation2(self):
+        """Test the comprehensive multi-factor FDR calculation method"""
+        scoreline_fixtures = self.db.scorelineProbabilities.distinct("fixture_id")
+        
+        if not scoreline_fixtures:
+            logger.error("No fixtures with scoreline probabilities found")
+            return
+        
+        logger.info(f"Found {len(scoreline_fixtures)} fixtures with scoreline probabilities")
+        
+        for fixture_id in scoreline_fixtures:
+            # Find fixture with proper handling for Goalserve structure
+            fixture = self.db.fixtures.find_one({"id": fixture_id})
+            
+            if not fixture:
+                logger.warning(f"Could not find fixture for ID {fixture_id}")
+                continue
+                
+            # Extract team data
+            home_name, away_name, home_team_id, away_team_id = self.extract_team_data(fixture)
+            
+            if not home_team_id or not away_team_id:
+                logger.warning(f"Missing team IDs for fixture {fixture_id}")
+                continue
+            
+            # Get league ID with support for category_id as fallback
+            league_id = fixture.get("league_id") or fixture.get("league", {}).get("id") or fixture.get("category_id")
+            
+            if not league_id:
+                logger.warning(f"No league ID found for fixture {fixture_id}")
+                continue
+            
+            # Calculate xG from scoreline probabilities
+            home_xg, away_xg = self.calculate_xg_from_scoreline(fixture_id)
+            if home_xg is None:
+                logger.warning(f"Could not calculate xG for {home_name} vs {away_name}")
+                continue
+            
+            logger.info(f"Fixture: {home_name} vs {away_name}")
+            logger.info(f"Pure xG values - Home: {home_xg:.2f}, Away: {away_xg:.2f}")
+            
+            # Calculate league averages
+            home_league_avg, away_league_avg = self.get_league_average_xg(league_id)
+            logger.info(f"League averages - Home: {home_league_avg:.2f}, Away: {away_league_avg:.2f}")
+            
+            # Get additional components
+            home_outright = self.calculate_outright_component(home_team_id)
+            away_outright = self.calculate_outright_component(away_team_id)
+            home_form = self.calculate_form_component(home_team_id)
+            away_form = self.calculate_form_component(away_team_id)
+            historical = self.calculate_historical_component(home_team_id, away_team_id)
+            home_availability = self.calculate_availability_component(home_team_id)
+            away_availability = self.calculate_availability_component(away_team_id)
+            
+            logger.info(f"Outright - Home: {home_outright:.2f}, Away: {away_outright:.2f}")
+            logger.info(f"Form - Home: {home_form:.2f}, Away: {away_form:.2f}")
+            logger.info(f"Historical - Home: {historical[0]:.2f}, Away: {historical[1]:.2f}")
+            logger.info(f"Availability - Home: {home_availability:.2f}, Away: {away_availability:.2f}")
+            
+            # Apply comprehensive weighting with your priority order
+            home_xg_adjusted = (
+                0.60 * home_xg +                                   # xG: 60%
+                0.15 * (1.0 - home_outright) * home_league_avg +   # Outright: 15%
+                0.10 * home_form * home_league_avg +               # Recent Form: 10%
+                0.10 * (1.0 - historical[0]) * home_league_avg +   # Historical: 10% 
+                0.05 * (1.0 - home_availability) * home_league_avg # Availability: 5%
+            )
+            
+            away_xg_adjusted = (
+                0.60 * away_xg +                                   # xG: 60%
+                0.15 * (1.0 - away_outright) * away_league_avg +   # Outright: 15%
+                0.10 * away_form * away_league_avg +               # Recent Form: 10%
+                0.10 * (1.0 - historical[1]) * away_league_avg +   # Historical: 10%
+                0.05 * (1.0 - away_availability) * away_league_avg # Availability: 5%
+            )
+            
+            logger.info(f"Adjusted xG values - Home: {home_xg_adjusted:.2f}, Away: {away_xg_adjusted:.2f}")
+            
+            # Calculate strength coefficients using adjusted xG
+            home_attack = home_xg_adjusted / home_league_avg
+            away_attack = away_xg_adjusted / away_league_avg
+            home_defense = away_xg_adjusted / away_league_avg
+            away_defense = home_xg_adjusted / home_league_avg
+            
+            logger.info(f"Adjusted strengths - Home attack: {home_attack:.2f}, Home defense: {home_defense:.2f}")
+            logger.info(f"Adjusted strengths - Away attack: {away_attack:.2f}, Away defense: {away_defense:.2f}")
+            
+            # Calculate fixture strength
+            home_strength = home_attack * away_defense
+            away_strength = away_attack * home_defense
+            
+            logger.info(f"Fixture strength - Home: {home_strength:.2f}, Away: {away_strength:.2f}")
+            
+            # Calculate FDR
+            home_fdr = self.convert_strength_to_fdr(home_strength)
+            away_fdr = self.convert_strength_to_fdr(away_strength)
+            
+            logger.info(f"Multi-factor FDR - Home: {home_fdr:.2f}, Away: {away_fdr:.2f}")
+            logger.info("-" * 50)
+    
+    def extract_team_data(self, fixture):
+        """Extract team names and IDs from fixture"""
+        home_name = away_name = "Unknown"
+        home_id = away_id = None
+        
+        if "participants" in fixture and len(fixture["participants"]) >= 2:
+            home_name = fixture["participants"][0].get("name", "Home")
+            away_name = fixture["participants"][1].get("name", "Away")
+            home_id = fixture["participants"][0].get("id")
+            away_id = fixture["participants"][1].get("id")
+        elif "local_team" in fixture and "visitor_team" in fixture:
+            home_name = fixture["local_team"].get("name", "Home")
+            away_name = fixture["visitor_team"].get("name", "Away")
+            home_id = fixture["local_team"].get("id")
+            away_id = fixture["visitor_team"].get("id")
+        
+        return home_name, away_name, home_id, away_id
+
+
 
     
     def generate_match_summaries(self, days_ahead=14):
@@ -914,6 +1633,42 @@ class FDRCalculator:
             print(f"{scenario_name:<15} {home_fdr:<10.2f} {away_fdr:<10.2f} {home_category:<12} {away_category:<12}")
         
         print("-" * 80)
+    
+    def calculate_xg_from_scoreline(self, fixture_id):
+        """Calculate xG from scoreline probabilities with source priority"""
+        # Try Goalserve data first (primary)
+        probabilities = list(self.db.scorelineProbabilities.find({
+            "fixture_id": fixture_id,
+            "source": "goalserve"
+        }))
+        
+        # Fall back to SportMonks if needed
+        if not probabilities:
+            probabilities = list(self.db.scorelineProbabilities.find({
+                "fixture_id": fixture_id
+            }))
+        
+        if not probabilities:
+            # Try direct xG data as final fallback
+            xg_data = self.db.fixtureExpectedGoals.find_one({"fixture_id": fixture_id})
+            if xg_data:
+                return xg_data.get("home_xg"), xg_data.get("away_xg")
+            
+            logger.warning(f"No xG data available for fixture {fixture_id}")
+            return None, None
+        
+        home_xg = 0
+        away_xg = 0
+        
+        for prob in probabilities:
+            home_goals = prob.get("home_goals", 0)
+            away_goals = prob.get("away_goals", 0)
+            probability = prob.get("probability", 0) / 100
+            home_xg += home_goals * probability
+            away_xg += away_goals * probability
+        
+        return home_xg, away_xg
+
 
 
 
@@ -924,4 +1679,16 @@ if __name__ == "__main__":
     # calculator.test_epl_fixtures()
     # Calculate FDR for all upcoming fixtures
     # calculator.calculate_all_fixtures(days_ahead=14)
-    calculator.test_epl_fixtures()                                                                                                                                                                              
+    # from fdr_calculator import FDRDataCollector
+    # sportmonks_token = os.getenv("SPORTMONKS_API_KEY")
+    # goalserve_token = os.getenv("GOALSERVE_API_KEY", "0f6230689b674453eee508dd50f5b2ca")
+    
+    # MongoDB URI is directly configured in the class
+    # collector = FDRDataCollector(sportmonks_token, goalserve_token)
+    # colector = FDRDataCollector()
+    # colector.create_missing_fixture_mappings()
+
+    # Calculate FDR for each fixture
+    # calculator.calculate_fixture_fdr_new()
+    calculator.test_comprehensive_fdr_calculation2()
+    

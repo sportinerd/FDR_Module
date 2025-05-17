@@ -829,6 +829,261 @@ class FDRDataCollector:
             logger.warning("No valid scoreline probabilities found to save")
         
         return scoreline_probs
+    
+    def _format_goalserve_datetime(self, date_str, time_str):
+        """Format Goalserve date and time into standard format"""
+        if not date_str or not time_str:
+            return None
+        
+        try:
+            # Handle "May 18" format
+            if re.match(r"^\w+ \d+$", date_str):
+                current_year = datetime.now().year
+                date_obj = datetime.strptime(f"{date_str} {current_year}", "%b %d %Y")
+                if (datetime.now() - date_obj).days > 7:  # If date is past, assume next year
+                    date_obj = datetime.strptime(f"{date_str} {current_year+1}", "%b %d %Y")
+                date_str = date_obj.strftime("%Y-%m-%d")
+            
+            # Combine date and time
+            return f"{date_str} {time_str}"
+        except ValueError:
+            return None
+
+    def _normalize_scoreline_probabilities(self, probabilities):
+        """Normalize probabilities per fixture to account for bookmaker margin"""
+        fixtures = {}
+        
+        # Group by fixture
+        for prob in probabilities:
+            fixture_id = prob["fixture_id"]
+            if fixture_id not in fixtures:
+                fixtures[fixture_id] = []
+            fixtures[fixture_id].append(prob)
+        
+        # Normalize each fixture's probabilities
+        for fixture_id, fixture_probs in fixtures.items():
+            total_prob = sum(p["probability"] for p in fixture_probs)
+            for prob in fixture_probs:
+                prob["probability"] = (prob["probability"] / total_prob) * 100
+
+    def get_goalserve_fixtures(self, days_ahead=14):
+        """Get upcoming fixtures from Goalserve using direct API call"""
+        today = datetime.now().strftime("%d.%m.%Y")
+        future = (datetime.now() + timedelta(days=days_ahead)).strftime("%d.%m.%Y")
+        
+        logger.info(f"Fetching upcoming fixtures from Goalserve ({today} to {future})")
+        
+        # Construct the full URL directly
+        url = f"https://www.goalserve.com/getfeed/{self.goalserve_token}/getscores/soccer?date_start={today}&date_end={future}&json=true"
+        
+        try:
+            # Make the request directly using requests library
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()  # Raise exception for 4XX/5XX responses
+            
+            # Parse JSON response
+            data = response.json()
+            fixtures = []
+            
+            # Extract fixtures from categories
+            if "scores" in data and "categories" in data["scores"]:
+                for category in data["scores"]["categories"]:
+                    if "matches" in category:
+                        for match in category["matches"]:
+                            fixture = {
+                                "id": match.get("id"),
+                                "starting_at": self._format_goalserve_datetime(match.get("date"), match.get("time")),
+                                "category_name": category.get("name"),
+                                "category_id": category.get("id"),
+                                "local_team": match.get("localteam", {}),
+                                "visitor_team": match.get("visitorteam", {})
+                            }
+                            fixtures.append(fixture)
+            
+            self.save_to_mongodb("fixtures", fixtures, identifier_field="id")
+            logger.info(f"Saved {len(fixtures)} fixtures from Goalserve")
+            return fixtures
+            
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error: {str(e)}")
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {str(e)}")
+            return []
+        except Exception as e:
+            logger.error(f"Error processing Goalserve fixtures: {str(e)}")
+            return []
+
+
+    def get_goalserve_scoreline_probabilities(self):
+        """Extract scoreline probabilities from Goalserve correct score odds"""
+        logger.info("Fetching scoreline probabilities from Goalserve")
+        
+        today = datetime.now().strftime("%d.%m.%Y")
+        future = (datetime.now() + timedelta(days=14)).strftime("%d.%m.%Y")
+        
+        url = f"https://www.goalserve.com/getfeed/0f6230689b674453eee508dd50f5b2ca/getodds/soccer?cat=soccer_10&league=1204&date_start={today}&date_end={future}&market=81,22845,23132&json=true"
+        
+        try:
+            response = requests.get(url, timeout=30)
+            response.raise_for_status()
+            
+            scoreline_probs = []
+            
+            # Use response.json() instead of json.loads(response)
+            data = response.json()
+            
+            if "scores" in data and "categories" in data["scores"]:
+                for category in data["scores"]["categories"]:
+                    for match in category.get("matches", []):
+                        fixture_id = match.get("id")
+                        
+                        for odds_type in match.get("odds", []):
+                            if odds_type.get("value") == "Correct Score":
+                                for bookmaker in odds_type.get("bookmakers", []):
+                                    for odd in bookmaker.get("odds", []):
+                                        scoreline = odd.get("name")
+                                        value = odd.get("value")
+                                        
+                                        if scoreline and value and odd.get("stop") != "True":
+                                            try:
+                                                home_goals, away_goals = scoreline.split(":")
+                                                odd_value = float(value)
+                                                probability = (1 / odd_value) * 100
+                                                
+                                                scoreline_probs.append({
+                                                    "fixture_id": fixture_id,
+                                                    "home_goals": int(home_goals),
+                                                    "away_goals": int(away_goals),
+                                                    "probability": probability,
+                                                    "source": "goalserve"
+                                                })
+                                            except (ValueError, TypeError):
+                                                continue
+            
+            # Normalize probabilities per fixture
+            self._normalize_scoreline_probabilities(scoreline_probs)
+            
+            # Save to MongoDB
+            self.save_to_mongodb("scorelineProbabilities", scoreline_probs)
+            logger.info(f"Saved {len(scoreline_probs)} scoreline probabilities")
+            
+            return scoreline_probs
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error: {str(e)}")
+            return []
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {str(e)}")
+            return []
+        except Exception as e:
+            logger.error(f"Error processing scoreline odds: {str(e)}")
+            return []
+
+
+    def create_missing_fixture_mappings(self):
+        """Create fixture mappings between Goalserve and SportMonks fixtures"""
+        scoreline_fixtures = self.db.scorelineProbabilities.distinct("fixture_id")
+        
+        logger.info(f"Checking mappings for {len(scoreline_fixtures)} fixtures with scoreline probabilities")
+        created_count = 0
+        
+        for goalserve_id in scoreline_fixtures:
+            # Check if mapping already exists
+            existing = self.db.fixture_id_mapping.find_one({"goalserve_id": goalserve_id})
+            if existing:
+                continue
+                
+            # Get fixture details from your Goalserve fixtures collection
+            goalserve_fixture = self.db.fixtures.find_one({"id": goalserve_id})
+            
+            if not goalserve_fixture:
+                logger.warning(f"No fixture found in fixtures collection for ID {goalserve_id}")
+                continue
+                
+            try:
+                # Extract team names and date from Goalserve fixture
+                if "participants" in goalserve_fixture and len(goalserve_fixture["participants"]) >= 2:
+                    home_team = goalserve_fixture["participants"][0]["name"]
+                    away_team = goalserve_fixture["participants"][1]["name"]
+                else:
+                    home_team = goalserve_fixture.get("local_team", {}).get("name")
+                    away_team = goalserve_fixture.get("visitor_team", {}).get("name")
+                
+                match_date = goalserve_fixture["starting_at"].split(" ")[0]
+                
+                # Search SportMonks for this match
+                search_params = {
+                    "filters": f"date:{match_date}",
+                    "include": "participants"
+                }
+                sportmonks_fixtures = self.sportmonks_request("/fixtures", search_params)
+                
+                if sportmonks_fixtures and "data" in sportmonks_fixtures:
+                    # Find best matching fixture in SportMonks data
+                    for sportmonks_fixture in sportmonks_fixtures["data"]:
+                        if "participants" not in sportmonks_fixture or len(sportmonks_fixture["participants"]) < 2:
+                            continue
+                            
+                        sm_home = sportmonks_fixture["participants"][0]["name"]
+                        sm_away = sportmonks_fixture["participants"][1]["name"]
+                        
+                        # Compare team names with some fuzzy matching
+                        if (fuzz.ratio(self.normalize_team_name(sm_home), self.normalize_team_name(home_team)) > 80 and
+                            fuzz.ratio(self.normalize_team_name(sm_away), self.normalize_team_name(away_team)) > 80):
+                            # We found a match!
+                            sportmonks_id = sportmonks_fixture["id"]
+                            self.update_fixture_mapping(goalserve_id, sportmonks_id)
+                            logger.info(f"Created mapping for {home_team} vs {away_team}")
+                            created_count += 1
+                            break
+                
+            except (KeyError, IndexError) as e:
+                logger.error(f"Error processing fixture {goalserve_id}: {str(e)}")
+        
+        logger.info(f"Created {created_count} new fixture mappings")
+        return created_count
+
+    def get_fixtures_from_both_sources(self, days_ahead=14):
+        """Get fixtures from both SportMonks and Goalserve and create mappings"""
+        # First get SportMonks fixtures
+        sportmonks_fixtures = self.get_upcoming_fixtures(days_ahead)
+        
+        # Then get Goalserve fixtures
+        goalserve_fixtures = self.get_goalserve_fixtures(days_ahead)
+        
+        # Create mappings between them
+        self.create_bidirectional_mappings(sportmonks_fixtures, goalserve_fixtures)
+        
+        return sportmonks_fixtures
+
+    def create_bidirectional_mappings(self, sportmonks_fixtures, goalserve_fixtures):
+        """Create mappings between SportMonks and Goalserve fixtures"""
+        sportmonks_dict = {}
+        for fixture in sportmonks_fixtures:
+            if "participants" in fixture and len(fixture["participants"]) >= 2:
+                home = self.normalize_team_name(fixture["participants"][0]["name"])
+                away = self.normalize_team_name(fixture["participants"][1]["name"])
+                date = fixture["starting_at"].split(" ")[0]
+                key = f"{home}|{away}|{date}"
+                sportmonks_dict[key] = fixture["id"]
+        
+        mapped_count = 0
+        for fixture in goalserve_fixtures:
+            home = self.normalize_team_name(fixture.get("local_team", {}).get("name", ""))
+            away = self.normalize_team_name(fixture.get("visitor_team", {}).get("name", ""))
+            date_str = fixture.get("starting_at", "").split(" ")[0]
+            
+            key = f"{home}|{away}|{date_str}"
+            if key in sportmonks_dict:
+                sportmonks_id = sportmonks_dict[key]
+                goalserve_id = fixture["id"]
+                
+                # Create the mapping
+                self.update_fixture_mapping(goalserve_id, sportmonks_id)
+                mapped_count += 1
+        
+        logger.info(f"Created {mapped_count} fixture mappings")
+        return mapped_count
 
 
     def collect_all_fdr_data(self, major_league_ids=None):
@@ -866,32 +1121,37 @@ class FDRDataCollector:
             self.get_teams_by_league(league_id)
             
             # Get historical matches (more seasons for major leagues)
-            seasons = 10 if is_major else 5
+            seasons = 5
             self.get_historical_matches(league_id, seasons)
         
         # 3. Get upcoming fixtures with odds
-        self.get_upcoming_fixtures()
-        
-        # 4. Get player availability
+        # self.get_upcoming_fixtures(days_ahead=14)
+        # 3. Get upcoming fixtures from both sources and create mappings
+        self.get_fixtures_from_both_sources(days_ahead=14)
+
+        # self.get_goalserve_fixtures(days_ahead=14)
+
+        # # 4. Get player availability
         self.get_player_availability()
         
-        # 5. Get predictions
-        self.get_predictions()
+        # # 5. Get predictions
+        # # self.get_predictions()
+        self.get_goalserve_scoreline_probabilities()
         
-        # 6. Get rivals for derby identification
+        # # 6. Get rivals for derby identification
         self.get_rivals()
         
-        # 7. Get outright odds from GoalServe
+        # # 7. Get outright odds from GoalServe
         self.get_goalserve_outright_odds()
         
-        # 8. Get fixture odds from GoalServe
+        # # 8. Get fixture odds from GoalServe
         self.get_goalserve_fixture_odds()
         
-        # 9. Get pre-match odds from Sportmonks
-        self.get_sportmonks_prematch_odds()
-        
+        # # 9. Get pre-match odds from Sportmonks
+        # # self.get_sportmonks_prematch_odds()
+        # self.create_missing_fixture_mappings()
         # 10. Get in-play odds from Sportmonks
-        self.get_sportmonks_inplay_odds()
+        # self.get_sportmonks_inplay_odds()
         
         logger.info("Complete FDR data collection finished")
 
@@ -903,5 +1163,5 @@ if __name__ == "__main__":
     
     # MongoDB URI is directly configured in the class
     collector = FDRDataCollector(sportmonks_token, goalserve_token)
-    # collector.collect_all_fdr_data()
-    collector.get_sportmonks_scoreline_probabilities()
+    collector.collect_all_fdr_data()
+    # collector.get_sportmonks_scoreline_probabilities()

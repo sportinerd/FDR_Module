@@ -1,0 +1,13 @@
+requests
+sqlalchemy
+python-dotenv
+pydantic
+pydantic-settings
+psycopg2-binary
+pymongo
+pymongo[srv]
+numpy
+pandas
+fastapi
+uvicorn
+fastapi[all]
