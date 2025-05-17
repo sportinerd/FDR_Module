@@ -1438,51 +1438,6 @@ class FDRCalculator:
 
 
     
-    def generate_match_summaries(self, days_ahead=14):
-        """Generate simplified match summaries with FDR ratings"""
-        start_date = datetime.now().strftime("%Y-%m-%d")
-        end_date = (datetime.now() + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
-        
-        fixtures = self.db.fixtures.find({
-            "starting_at": {"$gte": start_date}
-        })
-        
-        summaries = []
-        for fixture in fixtures:
-            try:
-                # Calculate FDR if not already calculated
-                if "fdr" not in fixture:
-                    self.calculate_fixture_fdr(fixture)
-                    # Fetch the updated fixture with FDR data
-                    fixture = self.db.fixtures.find_one({"_id": fixture["_id"]})
-                
-                if "fdr" not in fixture:
-                    continue
-                    
-                # Get team names
-                home_team = ""
-                away_team = ""
-                if "participants" in fixture and len(fixture["participants"]) >= 2:
-                    home_team = fixture["participants"][0].get("name", "Home")
-                    away_team = fixture["participants"][1].get("name", "Away")
-                
-                # Get FDR categories AND numerical values
-                home_fdr = fixture["fdr"]["overall"]["home"]["fdr"]
-                away_fdr = fixture["fdr"]["overall"]["away"]["fdr"]
-                home_category = fixture["fdr"]["overall"]["home"]["category"].lower()
-                away_category = fixture["fdr"]["overall"]["away"]["category"].lower()
-                
-                # Format the summary including numerical values
-                summary = f"{home_team} vs {away_team}\nfdr h {home_category} ({home_fdr:.1f}) - a {away_category} ({away_fdr:.1f})"
-                summaries.append(summary)
-                
-                # Print and also return the summaries
-                print(summary)
-                print("---")
-            except Exception as e:
-                continue
-        
-        return summaries
     
     def test_epl_fixtures(self):
         """Test FDR components for all English Premier League fixtures"""
@@ -1634,40 +1589,134 @@ class FDRCalculator:
         
         print("-" * 80)
     
-    def calculate_xg_from_scoreline(self, fixture_id):
-        """Calculate xG from scoreline probabilities with source priority"""
-        # Try Goalserve data first (primary)
-        probabilities = list(self.db.scorelineProbabilities.find({
-            "fixture_id": fixture_id,
-            "source": "goalserve"
-        }))
+    def calculate_fixture_fdr_comprehensive(self, fixture):
+        """Calculate comprehensive FDR using xG and all additional components"""
+        fixture_id = fixture.get("id")
+        league_id = fixture.get("league_id") or fixture.get("league", {}).get("id") or fixture.get("category_id")
         
-        # Fall back to SportMonks if needed
-        if not probabilities:
-            probabilities = list(self.db.scorelineProbabilities.find({
-                "fixture_id": fixture_id
-            }))
+        logger.info(f"Calculating comprehensive FDR for fixture {fixture_id}")
         
-        if not probabilities:
-            # Try direct xG data as final fallback
-            xg_data = self.db.fixtureExpectedGoals.find_one({"fixture_id": fixture_id})
-            if xg_data:
-                return xg_data.get("home_xg"), xg_data.get("away_xg")
-            
-            logger.warning(f"No xG data available for fixture {fixture_id}")
-            return None, None
+        # Extract team data
+        home_name, away_name, home_team_id, away_team_id = self.extract_team_data(fixture)
         
-        home_xg = 0
-        away_xg = 0
+        if not home_team_id or not away_team_id:
+            logger.warning(f"Missing team IDs for fixture {fixture_id}")
+            return False
         
-        for prob in probabilities:
-            home_goals = prob.get("home_goals", 0)
-            away_goals = prob.get("away_goals", 0)
-            probability = prob.get("probability", 0) / 100
-            home_xg += home_goals * probability
-            away_xg += away_goals * probability
+        if not league_id:
+            logger.warning(f"No league ID found for fixture {fixture_id}")
+            return False
         
-        return home_xg, away_xg
+        # Calculate xG from scoreline probabilities
+        home_xg, away_xg = self.calculate_xg_from_scoreline(fixture_id)
+        
+        # Fallback if no xG data available
+        if home_xg is None:
+            logger.warning(f"No xG data for {fixture_id}, using historical fallback")
+            # Try historical component as fallback
+            historical = self.calculate_historical_component(home_team_id, away_team_id)
+            home_xg = 1.4 * (1 - historical[0])  # Convert difficulty to expected goals
+            away_xg = 1.1 * (1 - historical[1])
+        
+        # Get league averages
+        home_league_avg, away_league_avg = self.get_league_average_xg(league_id)
+        
+        # Get additional components
+        home_outright = self.calculate_outright_component(home_team_id)
+        away_outright = self.calculate_outright_component(away_team_id)
+        home_form = self.calculate_form_component(home_team_id)
+        away_form = self.calculate_form_component(away_team_id)
+        historical = self.calculate_historical_component(home_team_id, away_team_id)
+        home_availability = self.calculate_availability_component(home_team_id)
+        away_availability = self.calculate_availability_component(away_team_id)
+        
+        # Apply comprehensive weighting with priority order
+        home_xg_adjusted = (
+            0.60 * home_xg +                                   # xG: 60%
+            0.15 * (1.0 - home_outright) * home_league_avg +   # Outright: 15%
+            0.10 * home_form * home_league_avg +               # Recent Form: 10%
+            0.10 * (1.0 - historical[0]) * home_league_avg +   # Historical: 10% 
+            0.05 * (1.0 - home_availability) * home_league_avg # Availability: 5%
+        )
+        
+        away_xg_adjusted = (
+            0.60 * away_xg +                                   # xG: 60%
+            0.15 * (1.0 - away_outright) * away_league_avg +   # Outright: 15%
+            0.10 * away_form * away_league_avg +               # Recent Form: 10%
+            0.10 * (1.0 - historical[1]) * away_league_avg +   # Historical: 10%
+            0.05 * (1.0 - away_availability) * away_league_avg # Availability: 5%
+        )
+        
+        # Calculate strength coefficients
+        home_attack = home_xg_adjusted / home_league_avg
+        away_attack = away_xg_adjusted / away_league_avg
+        home_defense = away_xg_adjusted / away_league_avg
+        away_defense = home_xg_adjusted / home_league_avg
+        
+        # Calculate fixture strength
+        home_strength = home_attack * away_defense
+        away_strength = away_attack * home_defense
+        
+        # Convert to FDR scale (0-10)
+        home_fdr = self.convert_strength_to_fdr(home_strength)
+        away_fdr = self.convert_strength_to_fdr(away_strength)
+        
+        # Get categories
+        home_category = self.get_fdr_category(home_fdr)
+        away_category = self.get_fdr_category(away_fdr)
+        
+        # Create FDR data structure for MongoDB
+        fdr_data = {
+            "overall": {
+                "home": {
+                    "raw_score": home_strength,
+                    "fdr": home_fdr,
+                    "category": home_category,
+                    "color": self.color_map[home_category],
+                    "xg": home_xg_adjusted,
+                    "original_xg": home_xg
+                },
+                "away": {
+                    "raw_score": away_strength,
+                    "fdr": away_fdr,
+                    "category": away_category,
+                    "color": self.color_map[away_category],
+                    "xg": away_xg_adjusted,
+                    "original_xg": away_xg
+                }
+            },
+            "components": {
+                "home": {
+                    "attack_strength": home_attack,
+                    "defense_weakness": home_defense,
+                    "outright": home_outright,
+                    "form": home_form,
+                    "historical": historical[0],
+                    "availability": home_availability
+                },
+                "away": {
+                    "attack_strength": away_attack,
+                    "defense_weakness": away_defense,
+                    "outright": away_outright,
+                    "form": away_form,
+                    "historical": historical[1],
+                    "availability": away_availability
+                }
+            },
+            "calculation_method": "comprehensive",
+            "calculated_at": datetime.now()
+        }
+        
+        # Save to MongoDB
+        self.db.fixtures.update_one(
+            {"id": fixture_id},
+            {"$set": {"fdr": fdr_data}}
+        )
+        
+        logger.info(f"Completed comprehensive FDR calculation for fixture {fixture_id}")
+        return True
+
+
 
 
 
