@@ -1085,6 +1085,35 @@ class FDRDataCollector:
         logger.info(f"Created {mapped_count} fixture mappings")
         return mapped_count
 
+    # Add this to collect_all_fdr_data after collecting fixtures
+    def verify_fixture_mappings(self):
+        """Verify all scoreline fixtures have corresponding entries"""
+        scoreline_fixtures = self.db.scorelineProbabilities.distinct("fixture_id")
+        logger.info(f"Verifying mappings for {len(scoreline_fixtures)} fixtures with scoreline data")
+        
+        missing = 0
+        for fixture_id in scoreline_fixtures:
+            # Try direct lookup
+            fixture = self.db.fixtures.find_one({"id": fixture_id})
+            if fixture:
+                continue
+                
+            # Try mapping lookup
+            mapping = self.db.fixture_id_mapping.find_one({"goalserve_id": fixture_id})
+            if mapping and mapping.get("sportmonks_id"):
+                fixture = self.db.fixtures.find_one({"id": mapping["sportmonks_id"]})
+                if fixture:
+                    continue
+                    
+            missing += 1
+            logger.warning(f"No fixture found for scoreline fixture ID: {fixture_id}")
+        
+        if missing:
+            logger.warning(f"Missing {missing}/{len(scoreline_fixtures)} fixtures with scoreline data")
+        else:
+            logger.info("All fixtures with scoreline data have corresponding fixtures")
+
+
 
     def collect_all_fdr_data(self, major_league_ids=None):
         """Collect all data needed for FDR calculation"""
@@ -1152,6 +1181,7 @@ class FDRDataCollector:
         # self.create_missing_fixture_mappings()
         # 10. Get in-play odds from Sportmonks
         # self.get_sportmonks_inplay_odds()
+        collector.verify_fixture_mappings()
         
         logger.info("Complete FDR data collection finished")
 
@@ -1164,4 +1194,5 @@ if __name__ == "__main__":
     # MongoDB URI is directly configured in the class
     collector = FDRDataCollector(sportmonks_token, goalserve_token)
     collector.collect_all_fdr_data()
+    
     # collector.get_sportmonks_scoreline_probabilities()
