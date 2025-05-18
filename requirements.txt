@@ -11,3 +11,7 @@ pandas
 fastapi
 uvicorn
 fastapi[all]
+flask
+apscheduler
+flask_cors
+gunicorn
